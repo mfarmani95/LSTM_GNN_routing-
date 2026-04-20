@@ -143,6 +143,3 @@ The command above uses a pre-rendered Ngen river-network panel (`docs/figures/NG
 
 To regenerate the left panel directly from Ngen GeoPackage flowpaths instead, replace `--network-image ...` with `--network data/ngen --outlet-gauges 09511300 09510000 09510200`.
 
-## Notes
-
-This repo is meant for routing-model experiments. If you later want physics-model runoff, keep that workflow in a separate integration repository and pass cached or generated runoff into the routing model through the same `runoff_total` interface.
