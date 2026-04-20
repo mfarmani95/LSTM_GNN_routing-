@@ -28,6 +28,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gauge-metadata", type=Path, default=None, help="Optional CSV with basin_id,x,y columns.")
     parser.add_argument("--output", type=Path, default=Path("docs/figures/ngen_network_vs_gnn_graph.png"))
     parser.add_argument("--no-reproject-network", action="store_true", help="Do not reproject Ngen flowpaths to the DEM/grid CRS.")
+    parser.add_argument("--dem-cmap", default="terrain", help="Matplotlib colormap for the SRTM/DEM background.")
+    parser.add_argument("--dem-alpha", type=float, default=0.62, help="Opacity for the SRTM/DEM background.")
+    parser.add_argument("--dem-contours", action="store_true", help="Overlay subtle SRTM/DEM contour lines.")
     parser.add_argument("--dpi", type=int, default=450)
     parser.add_argument("--edge-alpha", type=float, default=0.45)
     parser.add_argument("--edge-width", type=float, default=0.35)
@@ -129,8 +132,40 @@ def _graph_segments(graph: dict[str, np.ndarray | dict], node_x: np.ndarray, nod
     )
 
 
-def _plot_dem(ax, dem: np.ndarray, x2d: np.ndarray, y2d: np.ndarray) -> None:
-    ax.pcolormesh(x2d, y2d, np.where(np.isfinite(dem), dem, np.nan), cmap="Greys", shading="nearest", alpha=0.20)
+def _plot_dem(
+    ax,
+    dem: np.ndarray,
+    x2d: np.ndarray,
+    y2d: np.ndarray,
+    *,
+    cmap: str,
+    alpha: float,
+    contours: bool,
+) -> None:
+    values = np.ma.masked_invalid(dem)
+    ax.pcolormesh(
+        x2d,
+        y2d,
+        values,
+        cmap=cmap,
+        shading="nearest",
+        alpha=alpha,
+        zorder=1,
+    )
+    if contours:
+        finite = dem[np.isfinite(dem)]
+        if finite.size:
+            levels = np.linspace(float(np.nanpercentile(finite, 5)), float(np.nanpercentile(finite, 95)), 12)
+            ax.contour(
+                x2d,
+                y2d,
+                values,
+                levels=levels,
+                colors="#3b3b3b",
+                linewidths=0.10,
+                alpha=0.22,
+                zorder=2,
+            )
 
 
 def _plot_gauges(ax, gauge_metadata: Path | None, graph: dict[str, np.ndarray | dict]) -> None:
@@ -160,20 +195,28 @@ def main() -> None:
 
     fig, axes = plt.subplots(1, 2, figsize=(18, 8.5), sharex=True, sharey=True)
     for ax in axes:
-        _plot_dem(ax, dem, x2d, y2d)
+        _plot_dem(
+            ax,
+            dem,
+            x2d,
+            y2d,
+            cmap=args.dem_cmap,
+            alpha=args.dem_alpha,
+            contours=args.dem_contours,
+        )
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel("x projection [m]")
         ax.set_ylabel("y projection [m]")
 
-    network.plot(ax=axes[0], color="#238b45", linewidth=args.network_width, alpha=0.85)
+    network.plot(ax=axes[0], color="#169c49", linewidth=args.network_width, alpha=0.92, zorder=5)
     _plot_gauges(axes[0], args.gauge_metadata, graph)
     axes[0].set_title(
         "Ngen Source River Network: flowpaths layer\n"
         f"files={len(network_files)}, unique flowpaths={len(network)}"
     )
 
-    axes[1].add_collection(LineCollection(segments, colors="#225ea8", linewidths=args.edge_width, alpha=args.edge_alpha, zorder=4))
-    axes[1].scatter(node_x, node_y, s=1.0, c="#08306b", alpha=0.28, zorder=5, label="graph nodes")
+    axes[1].add_collection(LineCollection(segments, colors="#225ea8", linewidths=args.edge_width, alpha=args.edge_alpha, zorder=5))
+    axes[1].scatter(node_x, node_y, s=1.0, c="#08306b", alpha=0.28, zorder=6, label="graph nodes")
     if len(graph["gauge_index"]):
         gauge_x = node_x[graph["gauge_index"]]
         gauge_y = node_y[graph["gauge_index"]]

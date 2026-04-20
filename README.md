@@ -135,10 +135,12 @@ python -m lstm_gnn_routing.tools.plot_ngen_vs_gnn_graph \
   --graph data/graphs/routing_graph_ngen_salt_verde_cache.nc \
   --dem data/static/basin_srtm_dem_conditioned_on_forcing_grid.nc \
   --gauge-metadata data/streamflow/30_gauges_IN_LAMBERT.csv \
-  --output docs/figures/ngen_network_vs_gnn_graph.png
+  --output docs/figures/ngen_network_vs_gnn_graph.png \
+  --dem-cmap terrain \
+  --dem-alpha 0.62
 ```
 
-The left panel explicitly reads the Ngen GeoPackage `flowpaths` layer and plots those flowline geometries. The right panel plots the graph edges and graph nodes that the GNN actually uses during routing.
+Both panels use the SRTM DEM as the background. The left panel explicitly reads the Ngen GeoPackage `flowpaths` layer and plots those flowline geometries. The right panel plots the graph edges and graph nodes that the GNN actually uses during routing.
 
 ## Notes
 
