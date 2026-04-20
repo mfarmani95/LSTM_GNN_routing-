@@ -85,7 +85,9 @@ class RunoffRoutingPipeline(nn.Module):
         return int(value or 0)
 
     def forward(self, batch: Mapping[str, Any]) -> dict[str, torch.Tensor]:
-        runoff_batch = _move_value(batch, self.runoff_device)
+        runoff_keys = getattr(self.runoff_model, "input_keys", ())
+        runoff_batch = {key: batch[key] for key in runoff_keys if key in batch}
+        runoff_batch = _move_value(runoff_batch, self.runoff_device)
         runoff_outputs = self.runoff_model(runoff_batch)
 
         pre_trim = self._context_steps(batch, "runoff_pre_routing_trim_steps")
