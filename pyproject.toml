@@ -21,7 +21,9 @@ dependencies = [
 [project.optional-dependencies]
 preprocess = [
   "geopandas",
+  "matplotlib",
   "netCDF4",
+  "pyproj",
   "zarr",
 ]
 

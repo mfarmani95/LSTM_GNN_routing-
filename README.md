@@ -124,6 +124,22 @@ python -m lstm_gnn_routing.tools.aggregate_hourly_zarr_to_daily \
 
 The daily aggregation handles precipitation as an accumulated depth and uses daily means for flux/state variables. Check the tool options before production conversion.
 
+## Plot Ngen Network vs GNN Graph
+
+To compare the source Ngen flowpaths with the generated routing graph:
+
+```bash
+python -m lstm_gnn_routing.tools.plot_ngen_vs_gnn_graph \
+  --network data/ngen \
+  --outlet-gauges 09511300 09510000 09510200 \
+  --graph data/graphs/routing_graph_ngen_salt_verde_cache.nc \
+  --dem data/static/basin_srtm_dem_conditioned_on_forcing_grid.nc \
+  --gauge-metadata data/streamflow/30_gauges_IN_LAMBERT.csv \
+  --output docs/figures/ngen_network_vs_gnn_graph.png
+```
+
+The left panel plots the Ngen river network flowline geometries. The right panel plots the graph edges and graph nodes that the GNN actually uses during routing.
+
 ## Notes
 
 This repo is meant for routing-model experiments. If you later want physics-model runoff, keep that workflow in a separate integration repository and pass cached or generated runoff into the routing model through the same `runoff_total` interface.
