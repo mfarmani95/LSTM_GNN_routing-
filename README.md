@@ -130,8 +130,7 @@ To compare the source Ngen flowpaths with the generated routing graph:
 
 ```bash
 python -m lstm_gnn_routing.tools.plot_ngen_vs_gnn_graph \
-  --network data/ngen \
-  --outlet-gauges 09511300 09510000 09510200 \
+  --network-image docs/figures/NGEN_RIverNetwork.png \
   --graph data/graphs/routing_graph_ngen_salt_verde_cache.nc \
   --dem data/static/basin_srtm_dem_conditioned_on_forcing_grid.nc \
   --gauge-metadata data/streamflow/30_gauges_IN_LAMBERT.csv \
@@ -140,7 +139,9 @@ python -m lstm_gnn_routing.tools.plot_ngen_vs_gnn_graph \
   --dem-alpha 0.62
 ```
 
-Both panels use the SRTM DEM as the background. The left panel explicitly reads the Ngen GeoPackage `flowpaths` layer and plots those flowline geometries. The right panel plots the graph edges and graph nodes that the GNN actually uses during routing.
+The command above uses a pre-rendered Ngen river-network panel (`docs/figures/NGEN_RIverNetwork.png`) for presentation-quality maps. The right panel is generated from the graph cache and plots the graph edges and graph nodes that the GNN actually uses during routing, with the SRTM DEM in the background.
+
+To regenerate the left panel directly from Ngen GeoPackage flowpaths instead, replace `--network-image ...` with `--network data/ngen --outlet-gauges 09511300 09510000 09510200`.
 
 ## Notes
 

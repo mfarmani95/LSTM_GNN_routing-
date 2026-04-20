@@ -18,7 +18,13 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot the source Ngen river network next to the generated GNN routing graph."
     )
-    parser.add_argument("--network", nargs="+", type=Path, required=True, help="Ngen GeoPackage/shapefile paths or directories.")
+    parser.add_argument("--network", nargs="+", type=Path, default=None, help="Ngen GeoPackage/shapefile paths or directories.")
+    parser.add_argument(
+        "--network-image",
+        type=Path,
+        default=None,
+        help="Optional pre-rendered Ngen river-network image to use as the left panel.",
+    )
     parser.add_argument("--network-pattern", default="**/*_subset.gpkg", help="Glob used when a network input is a directory.")
     parser.add_argument("--flowpath-layer", default="flowpaths", help="GeoPackage layer containing Ngen flowpaths.")
     parser.add_argument("--outlet-gauges", nargs="*", default=None, help="Optional gauge IDs used to select gage-* network files.")
@@ -168,6 +174,13 @@ def _plot_dem(
             )
 
 
+def _plot_network_image(ax, image_path: Path) -> None:
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Ngen river-network image does not exist: {image_path}")
+    ax.imshow(plt.imread(image_path))
+    ax.axis("off")
+
+
 def _plot_gauges(ax, gauge_metadata: Path | None, graph: dict[str, np.ndarray | dict]) -> None:
     if gauge_metadata is None or not gauge_metadata.is_file():
         return
@@ -184,17 +197,32 @@ def _plot_gauges(ax, gauge_metadata: Path | None, graph: dict[str, np.ndarray | 
 
 def main() -> None:
     args = _parse_args()
-    network_files = _discover_network_files(args.network, args.network_pattern, args.outlet_gauges)
-    network = _read_flowpaths(network_files, args.flowpath_layer)
+    if args.network_image is None and not args.network:
+        raise ValueError("Provide either --network-image or --network.")
+
+    network_files: list[Path] = []
+    network = None
+    if args.network_image is None:
+        network_files = _discover_network_files(args.network or [], args.network_pattern, args.outlet_gauges)
+        network = _read_flowpaths(network_files, args.flowpath_layer)
+
     dem, x2d, y2d, dem_crs = _load_dem(args.dem, args.dem_variable)
-    if dem_crs is not None and network.crs is not None and not args.no_reproject_network:
+    if network is not None and dem_crs is not None and network.crs is not None and not args.no_reproject_network:
         network = network.to_crs(dem_crs)
     graph = _load_graph(args.graph)
     node_x, node_y = _graph_node_coordinates(graph, x2d, y2d)
     segments = _graph_segments(graph, node_x, node_y)
 
-    fig, axes = plt.subplots(1, 2, figsize=(18, 8.5), sharex=True, sharey=True)
-    for ax in axes:
+    use_network_image = args.network_image is not None
+    fig, axes = plt.subplots(1, 2, figsize=(20, 9.5), sharex=not use_network_image, sharey=not use_network_image)
+
+    if use_network_image:
+        _plot_network_image(axes[0], args.network_image)
+        graph_axes = [axes[1]]
+    else:
+        graph_axes = axes
+
+    for ax in graph_axes:
         _plot_dem(
             ax,
             dem,
@@ -208,19 +236,20 @@ def main() -> None:
         ax.set_xlabel("x projection [m]")
         ax.set_ylabel("y projection [m]")
 
-    network.plot(ax=axes[0], color="#169c49", linewidth=args.network_width, alpha=0.92, zorder=5)
-    _plot_gauges(axes[0], args.gauge_metadata, graph)
-    axes[0].set_title(
-        "Ngen Source River Network: flowpaths layer\n"
-        f"files={len(network_files)}, unique flowpaths={len(network)}"
-    )
+    if network is not None:
+        network.plot(ax=axes[0], color="#169c49", linewidth=args.network_width, alpha=0.92, zorder=5)
+        _plot_gauges(axes[0], args.gauge_metadata, graph)
+        axes[0].set_title(
+            "Ngen Source River Network: flowpaths layer\n"
+            f"files={len(network_files)}, unique flowpaths={len(network)}"
+        )
 
     axes[1].add_collection(LineCollection(segments, colors="#225ea8", linewidths=args.edge_width, alpha=args.edge_alpha, zorder=5))
-    axes[1].scatter(node_x, node_y, s=1.0, c="#08306b", alpha=0.28, zorder=6, label="graph nodes")
+    axes[1].scatter(node_x, node_y, s=1.5, c="#08519c", alpha=0.35, zorder=6, label="Flowpath graph nodes")
     if len(graph["gauge_index"]):
         gauge_x = node_x[graph["gauge_index"]]
         gauge_y = node_y[graph["gauge_index"]]
-        axes[1].scatter(gauge_x, gauge_y, s=22, c="#ff7f00", edgecolor="black", linewidth=0.25, zorder=7, label="gauge nodes")
+        axes[1].scatter(gauge_x, gauge_y, s=35, c="#ff7f00", edgecolor="black", linewidth=0.4, zorder=7, label="Gauge graph nodes")
     _plot_gauges(axes[1], args.gauge_metadata, graph)
 
     attrs = graph["attrs"]
@@ -231,13 +260,15 @@ def main() -> None:
     except Exception:
         outlet_gauges = str(outlet_gauges)
     axes[1].set_title(
-        "Generated GNN Routing Graph\n"
-        f"nodes={len(node_x)}, edges={len(graph['edge_source'])}, components={component_count}, outlets={outlet_gauges}"
+        "Generated Ngen Routing Graph on DEM Grid\n"
+        f"nodes={len(node_x)}, edges={len(graph['edge_source'])}, gauges={len(graph['gauge_id'])}, "
+        f"components={component_count}, outlets={outlet_gauges}"
     )
 
     xmin, xmax = float(np.nanmin(x2d)), float(np.nanmax(x2d))
     ymin, ymax = float(np.nanmin(y2d)), float(np.nanmax(y2d))
-    for ax in axes:
+    limit_axes = [axes[1]] if use_network_image else axes
+    for ax in limit_axes:
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymin, ymax)
         if ax.get_legend_handles_labels()[0]:
