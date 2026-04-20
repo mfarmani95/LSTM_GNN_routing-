@@ -138,7 +138,7 @@ python -m lstm_gnn_routing.tools.plot_ngen_vs_gnn_graph \
   --output docs/figures/ngen_network_vs_gnn_graph.png
 ```
 
-The left panel plots the Ngen river network flowline geometries. The right panel plots the graph edges and graph nodes that the GNN actually uses during routing.
+The left panel explicitly reads the Ngen GeoPackage `flowpaths` layer and plots those flowline geometries. The right panel plots the graph edges and graph nodes that the GNN actually uses during routing.
 
 ## Notes
 

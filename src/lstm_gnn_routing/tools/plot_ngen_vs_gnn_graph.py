@@ -167,7 +167,10 @@ def main() -> None:
 
     network.plot(ax=axes[0], color="#238b45", linewidth=args.network_width, alpha=0.85)
     _plot_gauges(axes[0], args.gauge_metadata, graph)
-    axes[0].set_title(f"Ngen Source River Network\nfiles={len(network_files)}, unique flowpaths={len(network)}")
+    axes[0].set_title(
+        "Ngen Source River Network: flowpaths layer\n"
+        f"files={len(network_files)}, unique flowpaths={len(network)}"
+    )
 
     axes[1].add_collection(LineCollection(segments, colors="#225ea8", linewidths=args.edge_width, alpha=args.edge_alpha, zorder=4))
     axes[1].scatter(node_x, node_y, s=1.0, c="#08306b", alpha=0.28, zorder=5, label="graph nodes")
