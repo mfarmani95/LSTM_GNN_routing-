@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.venv/
+*.egg-info/
+build/
+dist/
+runs/
+scalers/*.yml
+scalers/*.yaml
+data/
+*.pt
+*.pth
+*.ckpt

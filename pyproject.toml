@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lstm-gnn-routing"
+version = "0.1.0"
+description = "Standalone LSTM runoff generation and GNN streamflow routing experiments."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+  "ruamel.yaml",
+  "torch",
+  "torch-geometric",
+  "tqdm",
+  "xarray",
+]
+
+[project.optional-dependencies]
+preprocess = [
+  "geopandas",
+  "netCDF4",
+  "zarr",
+]
+
+[project.scripts]
+lstm-gnn-routing = "lstm_gnn_routing.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
