@@ -1672,26 +1672,6 @@ class RoutingDataset(Dataset):
 
         if source_kind == "forcing" and all(name in self.forcing_name_to_index for name in group_names):
             if target_frequency in {"daily", "1d", "day"}:
-                already_daily = bool(
-                    spec.get(
-                        "already_daily",
-                        spec.get("native_daily", str(spec.get("source_frequency", "")).lower() in {"daily", "1d", "day"}),
-                    )
-                )
-                if already_daily:
-                    means, stds = self._dynamic_scaler_for_base_forcing(group_name, group_names) if normalize else (None, None)
-                    return {
-                        "kind": "base_forcing_view",
-                        "names": list(group_names) + list(time_features),
-                        "channel_indices": [self.forcing_name_to_index[name] for name in group_names],
-                        "means": means,
-                        "stds": stds,
-                        "transforms": transforms,
-                        "time_features": time_features,
-                        "frequency": "daily",
-                        "include_spinup": bool(spec.get("include_spinup", False)),
-                    }
-
                 if normalize and not (spec.get("means") and spec.get("stds")):
                     logger.warning(
                         "Ignoring normalize=true for daily ML forcing group '%s' because daily aggregation "

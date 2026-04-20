@@ -64,7 +64,6 @@ ml:
     source: "forcing"
     variables: ["RAINRATE_mm_day", "LWDOWN_mean", "SWDOWN_mean", "T2D_mean", "Q2D_mean", "PSFC_mean", "U2D_mean", "V2D_mean"]
     target_frequency: "daily"
-    already_daily: true
     include_spinup: false
     normalize: true
     time_features: ["doy_sin", "doy_cos"]
