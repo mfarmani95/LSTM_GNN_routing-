@@ -383,8 +383,14 @@ class RoutingDataset(Dataset):
         if self.routing_compact_domain:
             forcing_total = self._compact_routing_array(forcing_total)
 
-        t_total = forcing_total.shape[0]
-        t_forecast = forcing_window.shape[0]
+        if self.uses_physical_runoff:
+            t_total = forcing_total.shape[0]
+            t_forecast = forcing_window.shape[0]
+        else:
+            # ML-only routing keeps physical forcing empty to avoid moving unused
+            # tensors, but the loss still spans the target forecast window.
+            t_total = int(target_window.shape[0])
+            t_forecast = int(target_window.shape[0])
 
         loss_mask = np.zeros((t_total,), dtype=np.bool_)
         loss_mask[-t_forecast:] = True
