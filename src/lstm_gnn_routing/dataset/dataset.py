@@ -325,6 +325,9 @@ class RoutingDataset(Dataset):
         self.window_eval_periods = bool(config.windowing.get("apply_to_validation_test", False))
         self.runoff_model_type = str(config.runoff_model.get("type", "lstm")).lower()
         self.uses_physical_runoff = False
+        self.runoff_dynamic_input_keys = {
+            str(value) for value in config.runoff_model.get("dynamic_input_keys", ["x_forcing_ml"])
+        }
         routing_model_cfg = config.section("routing_model")
         self.routing_lag_context_days = int(routing_model_cfg.get("routing_lag_context_days", 0) or 0)
         runoff_model_cfg = config.section("runoff_model")
@@ -536,7 +539,7 @@ class RoutingDataset(Dataset):
         }
 
         for group_name, group in self.optional_dynamic_groups.items():
-            dynamic_start = runoff_context_start if group_name == "x_forcing_ml" else f_start
+            dynamic_start = runoff_context_start if group_name in self.runoff_dynamic_input_keys else f_start
             dynamic_window = self._get_dynamic_group_window(group, dynamic_start, f_end)
             if group.get("include_spinup", True):
                 spinup_dynamic = repeat_spinup_block(

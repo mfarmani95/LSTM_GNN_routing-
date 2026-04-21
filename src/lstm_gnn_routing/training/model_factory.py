@@ -6,6 +6,7 @@ import torch
 
 from lstm_gnn_routing.routing_models.gnn_routing import GraphRoutingModel, HAS_TORCH_GEOMETRIC
 from lstm_gnn_routing.routing_models.runoff_transfer import GridToGraphRunoffTransfer
+from lstm_gnn_routing.runoff_models.precomputed_runoff import PrecomputedRunoffModel
 from lstm_gnn_routing.runoff_models.lstm_runoff import (
     SpatialLSTMRunoffModel,
     SpatialTemporalConvRunoffModel,
@@ -37,11 +38,26 @@ def _static_input_dim(tensor: torch.Tensor) -> int:
 def build_runoff_model(config, *, example_batch: Mapping[str, Any], device=None):
     runoff_cfg = config.section("runoff_model")
     model_type = str(runoff_cfg.get("type", "lstm")).lower()
-    if model_type not in {"lstm", "spatial_lstm", "temporal_conv", "tcn", "spatial_temporal_conv"}:
+    if model_type not in {"lstm", "spatial_lstm", "temporal_conv", "tcn", "spatial_temporal_conv", "precomputed", "identity", "passthrough"}:
         raise ValueError(f"Unsupported runoff_model.type '{model_type}'")
 
     dynamic_input_keys = tuple(runoff_cfg.get("dynamic_input_keys", ["x_forcing_ml"]))
     static_input_keys = tuple(runoff_cfg.get("static_input_keys", []))
+    if model_type in {"precomputed", "identity", "passthrough"}:
+        channel_names = tuple(
+            runoff_cfg.get(
+                "input_channel_names",
+                example_batch.get("x_info", [{}])[0].get(f"{dynamic_input_keys[0]}_names", []),
+            )
+        )
+        model = PrecomputedRunoffModel(
+            dynamic_input_keys=dynamic_input_keys,
+            output_keys=tuple(runoff_cfg.get("output_keys", ["RUNSF", "RUNSB"])),
+            input_channel_names=channel_names,
+            sanitize_nonfinite=bool(runoff_cfg.get("sanitize_nonfinite", True)),
+        )
+        return model.to(device=device) if device is not None else model
+
     input_dim = runoff_cfg.get("input_dim")
     if input_dim is None:
         inferred_dim = 0

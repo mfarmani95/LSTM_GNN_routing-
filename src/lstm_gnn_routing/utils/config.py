@@ -158,8 +158,11 @@ class RoutingConfig:
             "temporal_conv",
             "tcn",
             "spatial_temporal_conv",
+            "precomputed",
+            "identity",
+            "passthrough",
         }:
-            raise ValueError("runoff_model.type must be one of: lstm, temporal_conv")
+            raise ValueError("runoff_model.type must be one of: lstm, temporal_conv, precomputed")
         execution_cfg = self.section("execution")
         if execution_cfg:
             mode = str(execution_cfg.get("mode", "unified")).lower()
