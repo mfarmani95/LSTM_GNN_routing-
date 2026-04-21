@@ -363,6 +363,8 @@ class RoutingDataset(Dataset):
         self.routing_active_index: Optional[np.ndarray] = None
         self.routing_active_y_index: Optional[np.ndarray] = None
         self.routing_active_x_index: Optional[np.ndarray] = None
+        self.routing_active_sort_order: Optional[np.ndarray] = None
+        self.routing_active_inverse_sort_order: Optional[np.ndarray] = None
 
         self._load_all()
 
@@ -1299,14 +1301,18 @@ class RoutingDataset(Dataset):
             self.routing_compact_domain
             and self.routing_active_y_index is not None
             and self.routing_active_x_index is not None
+            and self.routing_active_sort_order is not None
+            and self.routing_active_inverse_sort_order is not None
             and y_dim in da.dims
             and x_dim in da.dims
         ):
             site_dim = "routing_site"
-            y_indexer = xr.DataArray(self.routing_active_y_index, dims=(site_dim,))
-            x_indexer = xr.DataArray(self.routing_active_x_index, dims=(site_dim,))
+            sorted_y_index = self.routing_active_y_index[self.routing_active_sort_order]
+            sorted_x_index = self.routing_active_x_index[self.routing_active_sort_order]
+            y_indexer = xr.DataArray(sorted_y_index, dims=(site_dim,))
+            x_indexer = xr.DataArray(sorted_x_index, dims=(site_dim,))
             da = da.isel({y_dim: y_indexer, x_dim: x_indexer}).transpose(time_dim, site_dim)
-            values = da.to_numpy()
+            values = da.to_numpy()[..., self.routing_active_inverse_sort_order]
         else:
             values = da.transpose(time_dim, y_dim, x_dim).to_numpy()
 
@@ -1319,6 +1325,8 @@ class RoutingDataset(Dataset):
         self.routing_active_index = None
         self.routing_active_y_index = None
         self.routing_active_x_index = None
+        self.routing_active_sort_order = None
+        self.routing_active_inverse_sort_order = None
         if not self.routing_compact_domain:
             return
         if not isinstance(self.routing_graph, Mapping):
@@ -1344,6 +1352,12 @@ class RoutingDataset(Dataset):
             raise ValueError("grid_shape metadata is required before compacting Routing inputs")
         self.routing_active_y_index = self.routing_active_index // int(grid_shape[1])
         self.routing_active_x_index = self.routing_active_index % int(grid_shape[1])
+        self.routing_active_sort_order = np.lexsort((self.routing_active_x_index, self.routing_active_y_index))
+        self.routing_active_inverse_sort_order = np.empty_like(self.routing_active_sort_order)
+        self.routing_active_inverse_sort_order[self.routing_active_sort_order] = np.arange(
+            self.routing_active_sort_order.size,
+            dtype=self.routing_active_sort_order.dtype,
+        )
         self.static_np = self._compact_routing_array(self.static_np)
 
         for group in self.optional_static_groups.values():
