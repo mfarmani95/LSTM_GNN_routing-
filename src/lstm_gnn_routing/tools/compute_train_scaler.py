@@ -13,6 +13,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Compute train-period forcing/static/target scalers.")
     parser.add_argument("--config-file", required=True, type=Path)
     parser.add_argument("--output", type=Path, default=None, help="Override scaler.path from the config")
+    parser.add_argument("--noah-config", type=str, default=None, help="Optional Noah config for noah_table_priors static features")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
 
@@ -21,6 +22,8 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     config = RoutingConfig.from_yaml(args.config_file)
+    if args.noah_config is not None:
+        config.set_noah_config_path(args.noah_config)
     output = args.output or Path(config.section("scaler").get("path", "scalers/train_scaler.yml"))
     if output.exists() and not args.overwrite:
         raise FileExistsError(f"Scaler file already exists: {output}. Pass --overwrite to replace it.")

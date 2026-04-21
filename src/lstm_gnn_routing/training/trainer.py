@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm.auto import tqdm
 
 from lstm_gnn_routing.dataset.batcher import RoutingBatcher
@@ -34,25 +34,92 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _move_value(value: Any, device: torch.device) -> Any:
-    if torch.is_tensor(value):
+def _to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
         return value.to(device=device, non_blocking=True)
     if isinstance(value, dict):
-        return {key: _move_value(item, device) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return type(value)(_move_value(item, device) for item in value)
+        return {key: _to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_device(item, device) for item in value)
     return value
 
 
-def _trim_time_prefix(outputs: Mapping[str, torch.Tensor], steps: int) -> dict[str, torch.Tensor]:
-    if steps <= 0:
-        return dict(outputs)
-    trimmed = {}
-    for key, value in outputs.items():
-        if torch.is_tensor(value) and value.ndim >= 2:
-            trimmed[key] = value[:, steps:].contiguous()
-        else:
+def _subset_mapping(mapping: Mapping[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    return {key: mapping[key] for key in keys if key in mapping}
+
+
+def _move_mapping_to_device(mapping: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in mapping.items():
+        result[key] = value if key == "x_info" else _to_device(value, device)
+    return result
+
+
+def _move_mapping_values_to_device(mapping: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
+    return {
+        key: value.to(device=device, non_blocking=True) if isinstance(value, torch.Tensor) else _to_device(value, device)
+        for key, value in mapping.items()
+    }
+
+
+def _trim_prediction_context(predictions: torch.Tensor, batch: Mapping[str, Any]) -> torch.Tensor:
+    context_steps = batch.get("prediction_context_steps")
+    if context_steps is None:
+        context_steps = batch.get("routing_context_steps")
+    if context_steps is None:
+        return predictions
+    context_tensor = torch.as_tensor(context_steps, device=predictions.device).reshape(-1)
+    if context_tensor.numel() == 0:
+        return predictions
+    first_context = int(context_tensor[0].item())
+    if first_context <= 0:
+        return predictions
+    if not torch.all(context_tensor == first_context):
+        raise ValueError("Batched samples must have the same prediction_context_steps for context trimming.")
+    if predictions.ndim < 2:
+        raise ValueError(
+            f"Cannot trim prediction context from prediction shape {tuple(predictions.shape)}; expected [B,T,...]"
+        )
+    if predictions.shape[1] <= first_context:
+        raise ValueError(
+            f"Prediction context length {first_context} is not smaller than prediction time length {predictions.shape[1]}"
+        )
+    return predictions[:, first_context:]
+
+
+def _trim_runoff_outputs_for_routing(
+    runoff_outputs: Mapping[str, Any],
+    batch: Mapping[str, Any],
+) -> dict[str, Any]:
+    trim_steps = batch.get("runoff_pre_routing_trim_steps")
+    if trim_steps is None:
+        return dict(runoff_outputs)
+
+    first_tensor = next((value for value in runoff_outputs.values() if isinstance(value, torch.Tensor)), None)
+    if first_tensor is None:
+        return dict(runoff_outputs)
+
+    trim_tensor = torch.as_tensor(trim_steps, device=first_tensor.device).reshape(-1)
+    if trim_tensor.numel() == 0:
+        return dict(runoff_outputs)
+    first_trim = int(trim_tensor[0].item())
+    if first_trim <= 0:
+        return dict(runoff_outputs)
+    if not torch.all(trim_tensor == first_trim):
+        raise ValueError("Batched samples must have the same runoff_pre_routing_trim_steps.")
+
+    trimmed: dict[str, Any] = {}
+    for key, value in runoff_outputs.items():
+        if not isinstance(value, torch.Tensor) or value.ndim < 2:
             trimmed[key] = value
+            continue
+        if value.shape[1] <= first_trim:
+            raise ValueError(
+                f"Runoff warm-up trim length {first_trim} is not smaller than runoff output time length {value.shape[1]} for '{key}'."
+            )
+        trimmed[key] = value[:, first_trim:]
     return trimmed
 
 
@@ -84,27 +151,68 @@ class RunoffRoutingPipeline(nn.Module):
             return int(value.reshape(-1)[0].detach().cpu().item())
         return int(value or 0)
 
-    def forward(self, batch: Mapping[str, Any]) -> dict[str, torch.Tensor]:
-        runoff_keys = getattr(self.runoff_model, "input_keys", ())
-        runoff_batch = {key: batch[key] for key in runoff_keys if key in batch}
-        runoff_batch = _move_value(runoff_batch, self.runoff_device)
-        runoff_outputs = self.runoff_model(runoff_batch)
+    def _runoff_model_batch_keys(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(str(key) for key in getattr(self.runoff_model, "input_keys", ())))
 
-        pre_trim = self._context_steps(batch, "runoff_pre_routing_trim_steps")
-        runoff_outputs = _trim_time_prefix(runoff_outputs, pre_trim)
+    def _runoff_transfer_batch_keys(self) -> tuple[str, ...]:
+        if self.runoff_transfer is None:
+            return ()
+        keys = list(getattr(self.runoff_transfer, "input_keys", ()))
+        graph_key = getattr(self.runoff_transfer, "graph_key", None)
+        if graph_key:
+            keys.append(str(graph_key))
+        return tuple(dict.fromkeys(str(key) for key in keys))
 
-        routing_batch = _move_value(batch, self.routing_device)
-        runoff_outputs = {
-            key: value.to(device=self.routing_device, non_blocking=True) if torch.is_tensor(value) else value
-            for key, value in runoff_outputs.items()
-        }
+    def _routing_batch_keys(self) -> tuple[str, ...]:
+        keys: list[str] = []
+        for attr_name in ("dynamic_input_keys", "static_input_keys", "input_keys"):
+            keys.extend(str(key) for key in getattr(self.routing_model, attr_name, ()))
+        for attr_name in ("graph_key", "weight_key"):
+            value = getattr(self.routing_model, attr_name, None)
+            if value:
+                keys.append(str(value))
+        return tuple(dict.fromkeys(keys))
+
+    def _batch_view_for_runoff_model(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
+        keys = self._runoff_model_batch_keys()
+        subset = batch if not keys else _subset_mapping(batch, keys)
+        return _move_mapping_to_device(subset, self.runoff_device)
+
+    def _batch_view_for_runoff_transfer(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
+        if self.runoff_transfer is None:
+            return {}
+        keys = self._runoff_transfer_batch_keys()
+        subset = batch if not keys else _subset_mapping(batch, keys)
+        return _move_mapping_to_device(subset, self.routing_device)
+
+    def _batch_view_for_routing(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
+        keys = self._routing_batch_keys()
+        subset = batch if not keys else _subset_mapping(batch, keys)
+        return _move_mapping_to_device(subset, self.routing_device)
+
+    def _route_outputs(self, runoff_outputs: Mapping[str, torch.Tensor], batch: Mapping[str, Any]) -> torch.Tensor:
+        routed_outputs = _move_mapping_values_to_device(runoff_outputs, self.routing_device)
         if self.runoff_transfer is not None:
-            runoff_outputs = self.runoff_transfer(runoff_outputs, routing_batch)
+            routed_outputs = self.runoff_transfer(
+                routed_outputs,
+                self._batch_view_for_runoff_transfer(batch),
+            )
+        routed = self.routing_model(routed_outputs, self._batch_view_for_routing(batch))
+        if isinstance(routed, Mapping):
+            if "predictions" in routed:
+                return routed["predictions"]
+            if "y_hat" in routed:
+                return routed["y_hat"]
+            raise KeyError("routing_model mapping output must contain 'predictions' or 'y_hat'")
+        return routed
 
-        prediction = self.routing_model(runoff_outputs, routing_batch)
-        routing_context = self._context_steps(batch, "routing_context_steps")
-        if routing_context > 0:
-            prediction = prediction[:, routing_context:].contiguous()
+    def forward(self, batch: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+        runoff_outputs = self.runoff_model(self._batch_view_for_runoff_model(batch))
+        if not isinstance(runoff_outputs, Mapping):
+            raise TypeError("runoff_model must return a mapping of runoff output tensors")
+        routing_runoff_outputs = _trim_runoff_outputs_for_routing(runoff_outputs, batch)
+        prediction = self._route_outputs(routing_runoff_outputs, batch)
+        prediction = _trim_prediction_context(prediction, batch)
         return {
             self.prediction_key: prediction,
             "runoff_outputs": runoff_outputs,
@@ -159,7 +267,8 @@ class LSTMGNNTrainer:
 
         self.loss_fn = get_loss_function(config)
         self.use_amp = bool(training_cfg.get("use_amp", False)) and self.routing_device.type == "cuda"
-        self.grad_scaler = GradScaler(enabled=self.use_amp)
+        self.amp_device_type = "cuda" if self.routing_device.type == "cuda" else self.routing_device.type
+        self.grad_scaler = GradScaler(self.amp_device_type, enabled=self.use_amp)
         self.grad_clip_norm = training_cfg.get("grad_clip_norm")
         self.skip_nonfinite_batches = bool(training_cfg.get("skip_nonfinite_batches", True))
         self.show_progress = bool(training_cfg.get("show_progress", True))
@@ -168,6 +277,7 @@ class LSTMGNNTrainer:
 
         self.optimizer = self._build_optimizer(float(training_cfg.get("learning_rate", 1e-3)))
         self.history_path = self.run_dir / "training_history.csv"
+        self._log_example_batch_probe(example_batch)
 
     def _build_optimizer(self, learning_rate: float):
         training_cfg = self.config.section("training")
@@ -178,6 +288,41 @@ class LSTMGNNTrainer:
         if optimizer_name == "adam":
             return torch.optim.Adam(params, lr=learning_rate)
         raise ValueError("training.optimizer must be one of: adam, adamw")
+
+    @staticmethod
+    def _tensor_shape(value: Any) -> tuple[int, ...] | None:
+        if torch.is_tensor(value):
+            return tuple(int(v) for v in value.shape)
+        return None
+
+    def _log_example_batch_probe(self, batch: Mapping[str, Any]) -> None:
+        graph = batch.get("routing_graph")
+        graph_nodes = graph.get("num_nodes") if isinstance(graph, Mapping) else None
+        graph_edges = graph.get("num_edges") if isinstance(graph, Mapping) else None
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                outputs = self.model(batch)
+        finally:
+            self.model.train(was_training)
+
+        runoff_shapes = {
+            key: tuple(int(v) for v in value.shape)
+            for key, value in (outputs.get("runoff_outputs", {}) or {}).items()
+            if torch.is_tensor(value)
+        }
+        logger.info(
+            "Example batch probe | x_forcing_ml=%s | x_static_ml=%s | y=%s | loss_mask=%s | routing_graph(nodes=%s, edges=%s) | runoff_outputs=%s | prediction=%s",
+            self._tensor_shape(batch.get("x_forcing_ml")),
+            self._tensor_shape(batch.get("x_static_ml")),
+            self._tensor_shape(batch.get("y")),
+            self._tensor_shape(batch.get("loss_mask")),
+            graph_nodes,
+            graph_edges,
+            runoff_shapes,
+            self._tensor_shape(outputs.get(self.prediction_key)),
+        )
 
     def _set_learning_rate(self, learning_rate: float) -> None:
         for group in self.optimizer.param_groups:
@@ -242,7 +387,7 @@ class LSTMGNNTrainer:
         )
         for batch in iterator:
             with torch.set_grad_enabled(train):
-                with autocast(enabled=self.use_amp):
+                with autocast(device_type=self.amp_device_type, enabled=self.use_amp):
                     outputs = self.model(batch)
                     prediction, target, mask, weights = self._prepare_loss_tensors(
                         batch,

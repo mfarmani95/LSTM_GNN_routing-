@@ -13,6 +13,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
     train_parser = subparsers.add_parser("train", help="Train the model")
     train_parser.add_argument("--config-file", required=True, type=Path, help="Path to YAML config")
+    train_parser.add_argument("--noah-config", type=str, default=None, help="Optional Noah config for noah_table_priors static features")
     return parser
 
 
@@ -25,6 +26,8 @@ def main(argv: list[str] | None = None):
     args = parser.parse_args(argv)
     if args.command == "train":
         config = RoutingConfig.from_yaml(args.config_file)
+        if args.noah_config is not None:
+            config.set_noah_config_path(args.noah_config)
         return start_training(config)
     parser.print_help()
     return None

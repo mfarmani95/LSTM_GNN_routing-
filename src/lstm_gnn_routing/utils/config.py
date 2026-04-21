@@ -258,6 +258,16 @@ class RoutingConfig:
             raise ValueError(f"'{section_name}' must be a YAML mapping when provided.")
         return dict(section)
 
+    def set_noah_config_path(self, path: str | Path) -> None:
+        """Expose an optional Noah config path to dataset-side static feature builders."""
+        path_text = str(path)
+        self._cfg.setdefault("noah", {})["config_path"] = path_text
+        ml_static = (self._cfg.get("ml") or {}).get("static")
+        if isinstance(ml_static, dict):
+            source = str(ml_static.get("source", ml_static.get("kind", ml_static.get("type", "")))).lower()
+            if source in {"noah_table", "noah_tables", "noah_table_priors", "table_priors", "noah_parameter_priors"}:
+                ml_static["noah_config"] = path_text
+
     @property
     def experiment_name(self) -> str:
         return self._get("experiment_name", "routing_run")

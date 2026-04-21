@@ -1,5 +1,7 @@
+import itertools
 import logging
 import pickle
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -36,6 +38,75 @@ logger = logging.getLogger(__name__)
 
 
 lstm_gnn_routing_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _is_noah_table_static_spec(spec: Mapping[str, Any]) -> bool:
+    source = str(spec.get("source", spec.get("kind", spec.get("type", "")))).lower()
+    return source in {
+        "noah_table",
+        "noah_tables",
+        "noah_table_priors",
+        "table_priors",
+        "noah_parameter_priors",
+    }
+
+
+def _matches_pattern(name: str, patterns: Sequence[str]) -> bool:
+    import fnmatch
+
+    return any(fnmatch.fnmatchcase(name, str(pattern)) for pattern in patterns)
+
+
+def _sanitize_table_channel_name(value: str) -> str:
+    return str(value).replace(".", "_").replace("/", "_").replace(" ", "_")
+
+
+def _table_channel_suffixes(field_name: str, tail_shape: Sequence[int]) -> List[str]:
+    if not tail_shape:
+        return [""]
+    if len(tail_shape) == 1 and int(tail_shape[0]) == 12 and field_name.endswith(("laim", "saim")):
+        return [
+            "jan", "feb", "mar", "apr", "may", "jun",
+            "jul", "aug", "sep", "oct", "nov", "dec",
+        ]
+    if len(tail_shape) == 1 and int(tail_shape[0]) == 4:
+        return [f"soil_layer_{idx + 1}" for idx in range(int(tail_shape[0]))]
+    return [f"channel_{idx}" for idx in range(int(np.prod(tuple(tail_shape))))]
+
+
+def _table_field_to_channels(
+    field_name: str,
+    values: Any,
+    *,
+    grid_shape: Sequence[int],
+    dtype: np.dtype,
+) -> tuple[np.ndarray, List[str], np.ndarray]:
+    array = np.asarray(torch.as_tensor(values).detach().cpu())
+    grid_shape = (int(grid_shape[0]), int(grid_shape[1]))
+
+    if array.ndim >= 2 and tuple(array.shape[:2]) == grid_shape:
+        field_array = array.astype(dtype, copy=False)
+        if array.ndim == 2:
+            channels = field_array[np.newaxis, ...]
+            suffixes = [""]
+        else:
+            tail_shape = tuple(int(v) for v in array.shape[2:])
+            channels = field_array.reshape(*grid_shape, -1).transpose(2, 0, 1)
+            suffixes = _table_channel_suffixes(field_name, tail_shape)
+    elif array.ndim >= 2 and tuple(array.shape[-2:]) == grid_shape:
+        channels = array.reshape(-1, *grid_shape).astype(dtype, copy=False)
+        field_array = np.moveaxis(channels, 0, -1) if channels.shape[0] > 1 else channels[0]
+        suffixes = [f"channel_{idx}" for idx in range(int(channels.shape[0]))]
+    else:
+        raise ValueError(
+            f"Noah table field '{field_name}' has shape {tuple(array.shape)}, "
+            f"which cannot be aligned to grid shape {grid_shape}"
+        )
+
+    base_name = _sanitize_table_channel_name(field_name)
+    names = [base_name if suffix == "" else f"{base_name}__{suffix}" for suffix in suffixes]
+    channels = np.nan_to_num(channels.astype(dtype, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    return channels, names, field_array
 
 
 def _format_channel_value(value: Any) -> str:
@@ -1044,13 +1115,20 @@ class RoutingDataset(Dataset):
             if not spec:
                 continue
             normalize = bool(spec.get("normalize", self.config.normalize_data if section_name == "ml" else False))
-            if not spec.get("variables"):
-                continue
-            self.optional_static_groups[group_name] = self._load_static_group_from_spec(
-                spec,
-                group_name=group_name,
-                normalize=normalize,
-            )
+            if _is_noah_table_static_spec(spec):
+                self.optional_static_groups[group_name] = self._load_noah_table_static_group_from_spec(
+                    spec,
+                    group_name=group_name,
+                    normalize=normalize,
+                )
+            else:
+                if not spec.get("variables"):
+                    continue
+                self.optional_static_groups[group_name] = self._load_static_group_from_spec(
+                    spec,
+                    group_name=group_name,
+                    normalize=normalize,
+                )
             self.x_info_global[f"{group_name}_names"] = list(self.optional_static_groups[group_name]["names"])
             if group_name == "x_routing_static":
                 self.x_info_global["routing_proj_y2d"] = self.optional_static_groups[group_name].get("y2d")
@@ -1418,6 +1496,165 @@ class RoutingDataset(Dataset):
             resolved.setdefault("open_kwargs", self.config.static_open_kwargs)
         resolved.update(dict(spec))
         return resolved
+
+    def _resolve_noah_config_path(self, spec: Mapping[str, Any]) -> Path | None:
+        raw_path = (
+            spec.get("noah_config")
+            or spec.get("noah_config_path")
+            or spec.get("config_path")
+            or self.config.section("noah").get("config_path")
+            or self.config.section("noah").get("config")
+            or self.config.section("noahmp").get("config_path")
+            or self.config.section("noahmp").get("config")
+        )
+        if not raw_path:
+            return None
+
+        path = Path(raw_path).expanduser()
+        if path.is_absolute():
+            return path
+
+        candidates = [
+            (Path.cwd() / path).resolve(),
+            (lstm_gnn_routing_PACKAGE_ROOT.parent / path).resolve(),
+            (lstm_gnn_routing_PACKAGE_ROOT / path).resolve(),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
+    def _load_noah_table_static_group_from_spec(
+        self,
+        spec: Mapping[str, Any],
+        *,
+        group_name: str,
+        normalize: bool,
+    ) -> Dict[str, Any]:
+        noah_config_path = self._resolve_noah_config_path(spec)
+        if noah_config_path is None:
+            raise ValueError(
+                f"Static group '{group_name}' uses source='noah_table_priors' but no Noah config was provided. "
+                "Set ml.static.noah_config or top-level noah.config_path."
+            )
+
+        package_root = None
+        explicit_root = (
+            spec.get("noah_package_root")
+            or self.config.section("noah").get("package_root")
+            or self.config.section("noahmp").get("package_root")
+        )
+        if explicit_root:
+            explicit_path = Path(explicit_root).expanduser().resolve()
+            if (explicit_path / "noahmp").is_dir():
+                package_root = explicit_path
+        if package_root is None:
+            for parent in noah_config_path.resolve().parents:
+                if (parent / "noahmp").is_dir():
+                    package_root = parent
+                    break
+                candidate = parent / "NOAHVEC"
+                if (candidate / "noahmp").is_dir():
+                    package_root = candidate
+                    break
+        if package_root is None:
+            raise ImportError(
+                "Could not locate the NoahVEC/noahmp package needed for source='noah_table_priors'. "
+                "Set ml.static.noah_package_root or top-level noah.package_root."
+            )
+        if str(package_root) not in sys.path:
+            sys.path.insert(0, str(package_root))
+
+        from noahmp.config import load_config
+        from noahmp.initializer import initialize_model
+        from noahmp.table_parameter_priors import build_table_parameter_prior_fields
+
+        noah_config = load_config(noah_config_path)
+        state = initialize_model(noah_config).state
+        fields = build_table_parameter_prior_fields(
+            state,
+            config=noah_config,
+            static_fields=self.static_field_arrays,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        if not fields:
+            raise RuntimeError(
+                f"No Noah table-derived fields were produced for static group '{group_name}'. "
+                "Check that VEG2D, BOTSOIL2D, landmask, and Noah table paths are configured."
+            )
+
+        include_fields = [str(value) for value in _as_list(spec.get("include_fields", spec.get("fields")))]
+        include_patterns = [str(value) for value in _as_list(spec.get("include_patterns"))]
+        exclude_fields = [str(value) for value in _as_list(spec.get("exclude_fields"))]
+        exclude_patterns = [str(value) for value in _as_list(spec.get("exclude_patterns"))]
+
+        if not include_fields and not include_patterns:
+            include_patterns = ["parameters.*"]
+            if not bool(spec.get("include_categories", False)):
+                exclude_fields.extend(["parameters.vegtype", "parameters.urban_flag", "parameters.veg"])
+
+        if bool(spec.get("include_categories", False)):
+            include_fields.extend(["domain.vegtyp", "domain.isltyp", "domain.ist", "parameters.vegtype"])
+
+        selected_fields: Dict[str, Any] = {}
+        for field_name, values in fields.items():
+            field_text = str(field_name)
+            included = (
+                (not include_fields and not include_patterns)
+                or field_text in include_fields
+                or _matches_pattern(field_text, include_patterns)
+            )
+            excluded = field_text in exclude_fields or _matches_pattern(field_text, exclude_patterns)
+            if included and not excluded:
+                selected_fields[field_text] = values
+
+        if not selected_fields:
+            raise RuntimeError(
+                f"No Noah table fields matched the filters for static group '{group_name}'. "
+                f"Available examples: {list(fields)[:10]}"
+            )
+
+        grid_shape = tuple(int(v) for v in self.x_info_global.get("grid_shape", self.static_np.shape[-2:]))
+        channel_arrays: List[np.ndarray] = []
+        channel_names: List[str] = []
+        field_arrays: Dict[str, np.ndarray] = {}
+        channel_map: Dict[str, List[str]] = {}
+
+        for field_name in sorted(selected_fields):
+            channels, names, field_array = _table_field_to_channels(
+                field_name,
+                selected_fields[field_name],
+                grid_shape=grid_shape,
+                dtype=self.dtype_np,
+            )
+            channel_arrays.append(channels)
+            channel_names.extend(names)
+            field_arrays[field_name] = field_array.astype(self.dtype_np, copy=False)
+            channel_map[field_name] = names
+
+        array = np.concatenate(channel_arrays, axis=0).astype(self.dtype_np, copy=False)
+        if normalize:
+            array = self._normalize_static_array(array, group_name, channel_names)
+
+        logger.info(
+            "Built Noah table static group '%s' | fields=%s | channels=%s | normalize=%s",
+            group_name,
+            len(selected_fields),
+            len(channel_names),
+            normalize,
+        )
+
+        return {
+            "array": array,
+            "names": channel_names,
+            "field_arrays": field_arrays,
+            "channel_map": channel_map,
+            "lat2d": self.x_info_global.get("lat2d"),
+            "lon2d": self.x_info_global.get("lon2d"),
+            "y2d": self.x_info_global.get("proj_y2d"),
+            "x2d": self.x_info_global.get("proj_x2d"),
+        }
 
     def _load_static_group_from_spec(
         self,
