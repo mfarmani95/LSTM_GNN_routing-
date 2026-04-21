@@ -20,6 +20,11 @@ def _broadcast_weights(weights: torch.Tensor | None, target: torch.Tensor) -> to
     if weights is None:
         return None
     result = weights.to(dtype=target.dtype, device=target.device)
+    if result.ndim == 1 and target.ndim >= 2:
+        view_shape = [1] * target.ndim
+        view_shape[-1] = int(result.shape[0])
+        result = result.reshape(*view_shape)
+        return result.expand_as(target)
     while result.ndim < target.ndim:
         result = result.unsqueeze(-1)
     return result.expand_as(target)
