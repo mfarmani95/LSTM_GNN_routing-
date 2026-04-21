@@ -144,7 +144,7 @@ def main(argv: list[str] | None = None) -> None:
                 store_path,
                 mode="w",
                 consolidated=True,
-                zarr_format=2,
+                zarr_version=2,
             )
         finally:
             ds.close()
