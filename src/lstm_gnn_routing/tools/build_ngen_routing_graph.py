@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import logging
 import sqlite3
 import sys
@@ -66,8 +67,32 @@ def _parse_args() -> argparse.Namespace:
         "--source-feature",
         action="append",
         default=["elevation", "cell_area_m2", "distance_to_flowpath_m"],
-        choices=["elevation", "cell_area_m2", "distance_to_flowpath_m", "x", "y"],
+        choices=[
+            "elevation",
+            "cell_area_m2",
+            "overlap_area_m2",
+            "overlap_fraction",
+            "distance_to_flowpath_m",
+            "x",
+            "y",
+        ],
         help="Runoff source feature to store for optional neural transfer. May be repeated.",
+    )
+    parser.add_argument(
+        "--runoff-mapping-method",
+        choices=["center", "fractional_area"],
+        default="center",
+        help=(
+            "How grid runoff sources are mapped to Ngen divides. 'center' assigns each active grid-cell center "
+            "to one containing divide. 'fractional_area' intersects grid-cell polygons with divides and stores "
+            "one source row per positive grid-cell/divide overlap."
+        ),
+    )
+    parser.add_argument(
+        "--min-overlap-fraction",
+        type=float,
+        default=1.0e-8,
+        help="Minimum grid-cell area fraction to keep when --runoff-mapping-method=fractional_area.",
     )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
@@ -226,8 +251,197 @@ def _nearest_flat_indices(points_x: np.ndarray, points_y: np.ndarray, x2d: np.nd
     return flat.astype(np.int64), y_idx, x_idx
 
 
+def _axis_cell_bounds(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    axis = np.asarray(axis, dtype=np.float64).reshape(-1)
+    if axis.size == 0:
+        raise ValueError("Cannot build grid-cell polygons from an empty coordinate axis")
+    if axis.size == 1:
+        return axis - 0.5, axis + 0.5
+
+    edges = np.empty(axis.size + 1, dtype=np.float64)
+    edges[1:-1] = 0.5 * (axis[:-1] + axis[1:])
+    edges[0] = axis[0] - (edges[1] - axis[0])
+    edges[-1] = axis[-1] + (axis[-1] - edges[-2])
+    lower = np.minimum(edges[:-1], edges[1:])
+    upper = np.maximum(edges[:-1], edges[1:])
+    return lower, upper
+
+
+def _active_grid_cell_polygons(grid: Mapping[str, Any]):
+    gpd, _, _ = _require_geospatial()
+    from shapely.geometry import box
+
+    active_y, active_x = np.where(grid["active_mask"])
+    source_flat = (active_y * int(grid["dem"].shape[1]) + active_x).astype(np.int64)
+    x_lower, x_upper = _axis_cell_bounds(grid["x2d"][0])
+    y_lower, y_upper = _axis_cell_bounds(grid["y2d"][:, 0])
+    geometry = [
+        box(float(x_lower[x]), float(y_lower[y]), float(x_upper[x]), float(y_upper[y]))
+        for y, x in zip(active_y, active_x)
+    ]
+    return gpd.GeoDataFrame(
+        {
+            "source_flat_index": source_flat,
+            "source_y": active_y.astype(np.int64),
+            "source_x": active_x.astype(np.int64),
+            "source_cell_area_m2": np.asarray([geom.area for geom in geometry], dtype=np.float64),
+            "elevation": grid["dem"][active_y, active_x].astype(np.float32),
+            "source_center_x": grid["x2d"][active_y, active_x].astype(np.float64),
+            "source_center_y": grid["y2d"][active_y, active_x].astype(np.float64),
+        },
+        geometry=geometry,
+        crs=grid["crs"],
+    )
+
+
 def _numeric(values: pd.Series, default: float = 0.0) -> np.ndarray:
     return pd.to_numeric(values, errors="coerce").fillna(default).to_numpy(dtype=np.float32)
+
+
+def _first_available_numeric(
+    frame: pd.DataFrame,
+    names: Iterable[str],
+    *,
+    default: float = 0.0,
+) -> np.ndarray:
+    for name in names:
+        if name in frame:
+            return _numeric(frame[name], default=default)
+    return np.full(len(frame), float(default), dtype=np.float32)
+
+
+def _topological_order_from_successor(successor: np.ndarray) -> list[int]:
+    num_nodes = int(successor.size)
+    indegree = np.zeros(num_nodes, dtype=np.int64)
+    for target in successor:
+        if int(target) >= 0:
+            indegree[int(target)] += 1
+
+    queue: deque[int] = deque(int(index) for index in np.where(indegree == 0)[0].tolist())
+    order: list[int] = []
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+        downstream = int(successor[node])
+        if downstream >= 0:
+            indegree[downstream] -= 1
+            if indegree[downstream] == 0:
+                queue.append(downstream)
+
+    if len(order) != num_nodes:
+        remaining = [int(index) for index in range(num_nodes) if index not in set(order)]
+        logger.warning(
+            "Routing graph topology is not a clean DAG for all nodes; appending %s unresolved nodes to topological order.",
+            len(remaining),
+        )
+        order.extend(remaining)
+    return order
+
+
+def _derive_node_hydrology_features(
+    *,
+    num_nodes: int,
+    edge_index: torch.Tensor,
+    flowpaths: pd.DataFrame,
+    local_length_m: np.ndarray,
+    local_slope: np.ndarray,
+    local_area_km2: np.ndarray,
+    total_area_km2: np.ndarray,
+    stream_order: np.ndarray,
+    musk_values: np.ndarray | None,
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    successor = np.full(num_nodes, -1, dtype=np.int64)
+    if edge_index.numel():
+        edge_np = edge_index.cpu().numpy()
+        for source, target in zip(edge_np[0], edge_np[1]):
+            source_idx = int(source)
+            target_idx = int(target)
+            if successor[source_idx] >= 0 and successor[source_idx] != target_idx:
+                logger.warning(
+                    "Node %s has multiple downstream targets (%s, %s); keeping the first target for derived features.",
+                    source_idx,
+                    int(successor[source_idx]),
+                    target_idx,
+                )
+                continue
+            successor[source_idx] = target_idx
+
+    topo_order = _topological_order_from_successor(successor)
+    positive_slope = np.maximum(local_slope.astype(np.float32), 1.0e-6)
+    valid_musk = (
+        musk_values is not None
+        and np.isfinite(musk_values).any()
+        and float(np.nanmax(musk_values)) > 0.0
+        and float(np.nanstd(musk_values)) > 1.0e-6
+    )
+    if valid_musk:
+        local_travel_time_proxy = np.maximum(np.asarray(musk_values, dtype=np.float32), 1.0e-6)
+        travel_time_source = "MusK"
+    else:
+        local_travel_time_proxy = (
+            np.maximum(local_length_m.astype(np.float32), 1.0) / np.sqrt(positive_slope)
+        ).astype(np.float32)
+        travel_time_source = "length_over_sqrt_slope"
+
+    distance_to_outlet_m = np.maximum(local_length_m.astype(np.float32), 0.0).copy()
+    travel_time_proxy_to_outlet = local_travel_time_proxy.copy()
+    upstream_flowpath_count = np.ones(num_nodes, dtype=np.float32)
+    upstream_area_km2 = np.maximum(local_area_km2.astype(np.float32), 0.0).copy()
+
+    for node in topo_order:
+        downstream = int(successor[node])
+        if downstream >= 0:
+            upstream_flowpath_count[downstream] += upstream_flowpath_count[node]
+            upstream_area_km2[downstream] += upstream_area_km2[node]
+
+    for node in reversed(topo_order):
+        downstream = int(successor[node])
+        if downstream >= 0:
+            distance_to_outlet_m[node] = local_length_m[node] + distance_to_outlet_m[downstream]
+            travel_time_proxy_to_outlet[node] = (
+                local_travel_time_proxy[node] + travel_time_proxy_to_outlet[downstream]
+            )
+
+    safe_total_area = np.maximum(total_area_km2.astype(np.float32), 1.0e-6)
+    incremental_area_fraction = np.clip(
+        np.maximum(local_area_km2.astype(np.float32), 0.0) / safe_total_area,
+        0.0,
+        1.0,
+    )
+    upstream_area_ratio = np.clip(
+        np.maximum(total_area_km2.astype(np.float32) - local_area_km2.astype(np.float32), 0.0) / safe_total_area,
+        0.0,
+        1.0,
+    )
+    component_ids = _component_ids(num_nodes, edge_index)
+    normalized_stream_order = np.zeros(num_nodes, dtype=np.float32)
+    for component_id in np.unique(component_ids):
+        mask = component_ids == int(component_id)
+        component_max = float(np.nanmax(stream_order[mask])) if bool(mask.any()) else 0.0
+        if component_max > 0.0:
+            normalized_stream_order[mask] = stream_order[mask] / component_max
+    derived = {
+        "local_length_m": local_length_m.astype(np.float32),
+        "distance_to_outlet_m": distance_to_outlet_m.astype(np.float32),
+        "local_travel_time_proxy": local_travel_time_proxy.astype(np.float32),
+        "travel_time_proxy_to_outlet": travel_time_proxy_to_outlet.astype(np.float32),
+        "incremental_area_fraction": incremental_area_fraction.astype(np.float32),
+        "upstream_area_ratio": upstream_area_ratio.astype(np.float32),
+        "upstream_flowpath_count": upstream_flowpath_count.astype(np.float32),
+        "upstream_area_km2_topologic": upstream_area_km2.astype(np.float32),
+        "normalized_stream_order": normalized_stream_order.astype(np.float32),
+        "is_outlet_node": (successor < 0).astype(np.float32),
+    }
+    metadata_notes = [
+        "distance_to_outlet_m",
+        "travel_time_proxy_to_outlet",
+        "incremental_area_fraction",
+        "upstream_area_ratio",
+        "upstream_flowpath_count",
+        "normalized_stream_order",
+        f"travel_time_proxy_source={travel_time_source}",
+    ]
+    return derived, metadata_notes
 
 
 def _build_graph_nodes_edges(ngen: Mapping[str, Any], grid: Mapping[str, Any]) -> dict[str, Any]:
@@ -264,6 +478,7 @@ def _build_graph_nodes_edges(ngen: Mapping[str, Any], grid: Mapping[str, Any]) -
     rep_x = np.asarray([geom.x for geom in reps], dtype=np.float64)
     rep_y = np.asarray([geom.y for geom in reps], dtype=np.float64)
     flat_index, node_y, node_x = _nearest_flat_indices(rep_x, rep_y, grid["x2d"], grid["y2d"])
+    node_dem_elevation = grid["dem"][node_y, node_x].astype(np.float32)
 
     nexus_to_downstream = {}
     if not nexus.empty and "id" in nexus and "toid" in nexus:
@@ -304,13 +519,116 @@ def _build_graph_nodes_edges(ngen: Mapping[str, Any], grid: Mapping[str, Any]) -
     slope = (
         _numeric(edge_rows["So"], default=0.0)
         if "So" in edge_rows
-        else _numeric(edge_rows.get("mean.slope", pd.Series(index=edge_rows.index)), default=0.0)
+        else _numeric(edge_rows.get("ChSlp", edge_rows.get("mean.slope", pd.Series(index=edge_rows.index))), default=0.0)
     )
-    musk = _numeric(edge_rows["MusK"], default=0.0) if "MusK" in edge_rows else np.zeros_like(length_m)
-    edge_attr = torch.as_tensor(np.stack([length_m, slope, musk], axis=1), dtype=torch.float32)
-    edge_weight_base = np.where(musk > 0.0, 1.0 / np.maximum(musk, 1.0e-6), 1.0 / np.maximum(length_m, 1.0))
+    edge_feature_arrays: list[np.ndarray] = [length_m, slope]
+    edge_feature_names: list[str] = ["Length_m", "So"]
+
+    optional_edge_columns = [
+        ("n", "n"),
+        ("nCC", "nCC"),
+        ("BtmWdth", "BtmWdth"),
+        ("TopWdth", "TopWdth"),
+        ("TopWdthCC", "TopWdthCC"),
+        ("MusX", "MusX"),
+        ("MusK", "MusK"),
+    ]
+    optional_edge_values: dict[str, np.ndarray] = {}
+    for column_name, feature_name in optional_edge_columns:
+        if column_name not in edge_rows:
+            continue
+        values = _numeric(edge_rows[column_name], default=0.0)
+        optional_edge_values[feature_name] = values
+        edge_feature_arrays.append(values)
+        edge_feature_names.append(feature_name)
+
+    positive_edge_slope = np.maximum(np.abs(slope), 1.0e-6)
+    edge_travel_time_proxy = (
+        np.maximum(optional_edge_values["MusK"], 1.0e-6)
+        if "MusK" in optional_edge_values
+        and np.isfinite(optional_edge_values["MusK"]).any()
+        and float(np.nanmax(optional_edge_values["MusK"])) > 0.0
+        and float(np.nanstd(optional_edge_values["MusK"])) > 1.0e-6
+        else np.maximum(length_m, 1.0) / np.sqrt(positive_edge_slope)
+    ).astype(np.float32)
+    edge_feature_arrays.append(edge_travel_time_proxy)
+    edge_feature_names.append("travel_time_proxy")
+
+    roughness_n = optional_edge_values.get("n")
+    if roughness_n is None:
+        roughness_n = np.full_like(length_m, 0.05, dtype=np.float32)
+    roughness_n = np.maximum(np.asarray(roughness_n, dtype=np.float32), 1.0e-6)
+
+    top_width = optional_edge_values.get("TopWdth")
+    if top_width is None:
+        top_width = optional_edge_values.get("BtmWdth")
+    if top_width is None:
+        top_width = np.ones_like(length_m, dtype=np.float32)
+    top_width = np.maximum(np.asarray(top_width, dtype=np.float32), 1.0e-6)
+
+    bottom_width = optional_edge_values.get("BtmWdth")
+    if bottom_width is None:
+        bottom_width = top_width
+    bottom_width = np.maximum(np.asarray(bottom_width, dtype=np.float32), 1.0e-6)
+
+    sqrt_slope = np.sqrt(positive_edge_slope).astype(np.float32)
+    velocity_proxy = (sqrt_slope / roughness_n).astype(np.float32)
+    manning_travel_time_proxy = (np.maximum(length_m, 1.0) / np.maximum(velocity_proxy, 1.0e-6)).astype(np.float32)
+    inverse_manning_travel_time_proxy = (1.0 / np.maximum(manning_travel_time_proxy, 1.0e-6)).astype(np.float32)
+    storage_proxy = (np.maximum(length_m, 1.0) * top_width).astype(np.float32)
+    conveyance_proxy = (top_width * sqrt_slope / roughness_n).astype(np.float32)
+    width_ratio_proxy = (top_width / bottom_width).astype(np.float32)
+
+    for feature_name, values in [
+        ("velocity_proxy", velocity_proxy),
+        ("manning_travel_time_proxy", manning_travel_time_proxy),
+        ("inverse_manning_travel_time_proxy", inverse_manning_travel_time_proxy),
+        ("storage_proxy", storage_proxy),
+        ("conveyance_proxy", conveyance_proxy),
+        ("width_ratio_proxy", width_ratio_proxy),
+    ]:
+        edge_feature_arrays.append(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32))
+        edge_feature_names.append(feature_name)
+
+    edge_attr = torch.as_tensor(np.stack(edge_feature_arrays, axis=1), dtype=torch.float32)
+    musk = optional_edge_values.get("MusK")
+    use_variable_musk = bool(
+        musk is not None
+        and np.isfinite(musk).any()
+        and float(np.nanmax(musk)) > 0.0
+        and float(np.nanstd(musk)) > 1.0e-6
+    )
+    edge_weight_base = (
+        1.0 / np.maximum(musk, 1.0e-6)
+        if use_variable_musk
+        else 1.0 / np.maximum(length_m, 1.0)
+    )
     edge_weight = torch.as_tensor(edge_weight_base.astype(np.float32), dtype=torch.float32)
 
+    local_length_m = _first_available_numeric(flowpaths, ("Length_m",), default=np.nan)
+    if not np.isfinite(local_length_m).any() or float(np.nanmax(local_length_m)) <= 0.0:
+        local_length_m = _first_available_numeric(flowpaths, ("lengthkm",), default=0.0) * 1000.0
+    else:
+        local_length_m = np.nan_to_num(local_length_m, nan=0.0, posinf=0.0, neginf=0.0)
+    local_slope = _first_available_numeric(flowpaths, ("So", "ChSlp", "mean.slope"), default=0.0)
+    local_area_km2 = _first_available_numeric(flowpaths, ("areasqkm",), default=0.0)
+    total_area_km2 = _first_available_numeric(flowpaths, ("tot_drainage_areasqkm", "TotDASqKM"), default=0.0)
+    stream_order = _first_available_numeric(flowpaths, ("order", "streamorde"), default=0.0)
+    musk_by_node = _first_available_numeric(flowpaths, ("MusK",), default=0.0) if "MusK" in flowpaths else None
+    derived_node_features, derived_node_feature_notes = _derive_node_hydrology_features(
+        num_nodes=len(node_ids),
+        edge_index=edge_index,
+        flowpaths=flowpaths,
+        local_length_m=local_length_m,
+        local_slope=local_slope,
+        local_area_km2=local_area_km2,
+        total_area_km2=total_area_km2,
+        stream_order=stream_order,
+        musk_values=musk_by_node,
+    )
+
+    node_features = [node_dem_elevation]
+    node_feature_names = ["node_dem_elevation_m"]
     node_feature_columns = [
         "lengthkm",
         "areasqkm",
@@ -322,12 +640,13 @@ def _build_graph_nodes_edges(ngen: Mapping[str, Any], grid: Mapping[str, Any]) -
         "mode.ISLTYP",
         "mode.IVGTYP",
     ]
-    node_features = []
-    node_feature_names = []
     for col in node_feature_columns:
         if col in flowpaths:
             node_features.append(_numeric(flowpaths[col]))
             node_feature_names.append(col)
+    for name, values in derived_node_features.items():
+        node_features.append(values)
+        node_feature_names.append(name)
     if node_features:
         node_features_np = np.stack(node_features, axis=1).astype(np.float32)
         node_features_np = np.nan_to_num(node_features_np, nan=0.0, posinf=0.0, neginf=0.0)
@@ -338,17 +657,19 @@ def _build_graph_nodes_edges(ngen: Mapping[str, Any], grid: Mapping[str, Any]) -
     payload = {
         "edge_index": edge_index,
         "edge_attr": edge_attr,
-        "edge_feature_names": ["Length_m", "So", "MusK"],
+        "edge_feature_names": edge_feature_names,
         "edge_weight": edge_weight,
         "flat_index": torch.as_tensor(flat_index, dtype=torch.long),
         "node_y": torch.as_tensor(node_y, dtype=torch.long),
         "node_x": torch.as_tensor(node_x, dtype=torch.long),
         "node_ids": node_ids,
         "node_features": torch.as_tensor(node_features_np, dtype=torch.float32),
+        "node_feature_names": node_feature_names,
         "metadata": {
             "builder": "ngen_flowpath",
             "node_feature_names": node_feature_names,
-            "edge_weight_feature": "inverse_MusK_or_length",
+            "derived_node_features": derived_node_feature_notes,
+            "edge_weight_feature": "inverse_MusK_if_variable_else_length",
             "grid_shape": tuple(int(v) for v in grid["dem"].shape),
         },
     }
@@ -498,23 +819,8 @@ def _map_gauges(
     payload["gauge_ids"] = gauge_ids
 
 
-def _map_grid_sources_to_flowpaths(payload: dict[str, Any], ngen: Mapping[str, Any], grid: Mapping[str, Any], source_features: list[str]) -> None:
+def _center_grid_sources_to_divides(divides, grid: Mapping[str, Any]):
     gpd, _, Point = _require_geospatial()
-    divides = ngen["divides"].copy()
-    flowpaths = ngen["flowpaths"].copy()
-    if divides.empty:
-        raise ValueError("Cannot build runoff transfer mapping without Ngen divides")
-    if "divide_id" not in divides:
-        raise ValueError("Ngen divides layer must contain divide_id")
-    if "divide_id" not in flowpaths:
-        raise ValueError("Ngen flowpaths layer must contain divide_id")
-
-    flowpaths["id"] = flowpaths["id"].astype(str)
-    flowpaths["divide_id"] = flowpaths["divide_id"].astype(str)
-    divides["divide_id"] = divides["divide_id"].astype(str)
-    divide_to_wb = dict(zip(flowpaths["divide_id"], flowpaths["id"]))
-    node_map = {str(node_id): idx for idx, node_id in enumerate(payload["node_ids"])}
-
     active_y, active_x = np.where(grid["active_mask"])
     source_flat = (active_y * int(grid["dem"].shape[1]) + active_x).astype(np.int64)
     points = [Point(float(grid["x2d"][y, x]), float(grid["y2d"][y, x])) for y, x in zip(active_y, active_x)]
@@ -523,7 +829,10 @@ def _map_grid_sources_to_flowpaths(payload: dict[str, Any], ngen: Mapping[str, A
             "source_flat_index": source_flat,
             "source_y": active_y.astype(np.int64),
             "source_x": active_x.astype(np.int64),
+            "source_cell_area_m2": np.full(len(source_flat), float(grid["cell_area_m2"]), dtype=np.float64),
             "elevation": grid["dem"][active_y, active_x].astype(np.float32),
+            "source_center_x": grid["x2d"][active_y, active_x].astype(np.float64),
+            "source_center_y": grid["y2d"][active_y, active_x].astype(np.float64),
         },
         geometry=points,
         crs=grid["crs"],
@@ -539,19 +848,108 @@ def _map_grid_sources_to_flowpaths(payload: dict[str, Any], ngen: Mapping[str, A
     if joined.empty:
         raise ValueError("No active grid cells were mapped to Ngen divides")
     joined = joined.drop_duplicates(subset=["source_flat_index"], keep="first").copy()
+    joined["overlap_area_m2"] = joined["source_cell_area_m2"].astype(np.float64)
+    joined["overlap_fraction"] = 1.0
+    return joined
+
+
+def _fractional_area_grid_sources_to_divides(
+    divides,
+    grid: Mapping[str, Any],
+    *,
+    min_overlap_fraction: float,
+):
+    gpd, _, _ = _require_geospatial()
+    source_gdf = _active_grid_cell_polygons(grid)
+    join_cols = ["divide_id", "geometry"]
+    if "id" in divides:
+        join_cols.append("id")
+
+    logger.info(
+        "Overlaying %s active grid-cell polygons with %s Ngen divides for fractional-area runoff transfer",
+        len(source_gdf),
+        len(divides),
+    )
+    joined = gpd.overlay(source_gdf, divides[join_cols], how="intersection", keep_geom_type=False)
+    if joined.empty:
+        raise ValueError("No active grid-cell polygons intersected Ngen divides")
+
+    joined["overlap_area_m2"] = joined.geometry.area.astype(np.float64)
+    joined["overlap_fraction"] = joined["overlap_area_m2"] / np.maximum(
+        joined["source_cell_area_m2"].astype(np.float64),
+        np.finfo(np.float64).eps,
+    )
+    min_fraction = max(0.0, float(min_overlap_fraction))
+    joined = joined[
+        (joined["overlap_area_m2"] > 0.0)
+        & np.isfinite(joined["overlap_fraction"])
+        & (joined["overlap_fraction"] >= min_fraction)
+    ].copy()
+    if joined.empty:
+        raise ValueError(
+            "All grid-cell/divide intersections were removed by min_overlap_fraction="
+            f"{min_fraction}"
+        )
+    return joined
+
+
+def _map_grid_sources_to_flowpaths(
+    payload: dict[str, Any],
+    ngen: Mapping[str, Any],
+    grid: Mapping[str, Any],
+    source_features: list[str],
+    *,
+    mapping_method: str = "center",
+    min_overlap_fraction: float = 1.0e-8,
+) -> None:
+    _, _, Point = _require_geospatial()
+    divides = ngen["divides"].copy()
+    flowpaths = ngen["flowpaths"].copy()
+    if divides.empty:
+        raise ValueError("Cannot build runoff transfer mapping without Ngen divides")
+    if "divide_id" not in divides:
+        raise ValueError("Ngen divides layer must contain divide_id")
+    if "divide_id" not in flowpaths:
+        raise ValueError("Ngen flowpaths layer must contain divide_id")
+
+    flowpaths["id"] = flowpaths["id"].astype(str)
+    flowpaths["divide_id"] = flowpaths["divide_id"].astype(str)
+    divides["divide_id"] = divides["divide_id"].astype(str)
+    divide_to_wb = dict(zip(flowpaths["divide_id"], flowpaths["id"]))
+    node_map = {str(node_id): idx for idx, node_id in enumerate(payload["node_ids"])}
+
+    method = str(mapping_method or "center").lower()
+    if method == "center":
+        joined = _center_grid_sources_to_divides(divides, grid)
+        mapping_label = "containing_divide_to_flowpath"
+        weight_kind = "cell_area_m2"
+    elif method == "fractional_area":
+        joined = _fractional_area_grid_sources_to_divides(
+            divides,
+            grid,
+            min_overlap_fraction=min_overlap_fraction,
+        )
+        mapping_label = "fractional_grid_cell_area_to_divide_to_flowpath"
+        weight_kind = "overlap_area_m2"
+    else:
+        raise ValueError("runoff_mapping_method must be one of: center, fractional_area")
+
     joined["wb_id"] = joined["divide_id"].map(divide_to_wb)
     joined = joined[joined["wb_id"].isin(node_map)]
     if joined.empty:
         raise ValueError("Grid cells joined to divides, but no divide_id mapped to graph flowpath nodes")
     joined["target_index"] = joined["wb_id"].map(node_map).astype(np.int64)
-    joined = joined.sort_values("source_flat_index").reset_index(drop=True)
+    joined = joined.sort_values(["source_flat_index", "target_index"]).reset_index(drop=True)
 
     target_index = joined["target_index"].to_numpy(dtype=np.int64)
     source_flat_index = joined["source_flat_index"].to_numpy(dtype=np.int64)
-    payload["runoff_source_index"] = torch.arange(len(joined), dtype=torch.long)
+    source_weight = joined["overlap_area_m2"].to_numpy(dtype=np.float32)
+    source_fraction = joined["overlap_fraction"].to_numpy(dtype=np.float32)
+    payload["runoff_source_index"] = torch.as_tensor(source_flat_index, dtype=torch.long)
     payload["runoff_source_flat_index"] = torch.as_tensor(source_flat_index, dtype=torch.long)
     payload["runoff_target_index"] = torch.as_tensor(target_index, dtype=torch.long)
-    payload["runoff_source_weight"] = torch.full((len(joined),), float(grid["cell_area_m2"]), dtype=torch.float32)
+    payload["runoff_source_weight"] = torch.as_tensor(source_weight, dtype=torch.float32)
+    payload["runoff_source_fraction"] = torch.as_tensor(source_fraction, dtype=torch.float32)
 
     features = []
     names = []
@@ -559,20 +957,28 @@ def _map_grid_sources_to_flowpaths(payload: dict[str, Any], ngen: Mapping[str, A
         features.append(joined["elevation"].to_numpy(dtype=np.float32))
         names.append("elevation")
     if "cell_area_m2" in source_features:
-        features.append(np.full(len(joined), float(grid["cell_area_m2"]), dtype=np.float32))
+        features.append(joined["source_cell_area_m2"].to_numpy(dtype=np.float32))
         names.append("cell_area_m2")
+    if "overlap_area_m2" in source_features:
+        features.append(joined["overlap_area_m2"].to_numpy(dtype=np.float32))
+        names.append("overlap_area_m2")
+    if "overlap_fraction" in source_features:
+        features.append(joined["overlap_fraction"].to_numpy(dtype=np.float32))
+        names.append("overlap_fraction")
     if "x" in source_features:
-        features.append(grid["x2d"].reshape(-1)[source_flat_index].astype(np.float32))
+        features.append(joined["source_center_x"].to_numpy(dtype=np.float32))
         names.append("x")
     if "y" in source_features:
-        features.append(grid["y2d"].reshape(-1)[source_flat_index].astype(np.float32))
+        features.append(joined["source_center_y"].to_numpy(dtype=np.float32))
         names.append("y")
     if "distance_to_flowpath_m" in source_features:
         flow_geom = flowpaths.set_index("id").geometry.to_dict()
         distances = []
-        for geom, wb_id in zip(joined.geometry, joined["wb_id"]):
+        for row in joined.itertuples(index=False):
+            source_point = Point(float(row.source_center_x), float(row.source_center_y))
+            wb_id = str(row.wb_id)
             target_geom = flow_geom.get(wb_id)
-            distances.append(float(geom.distance(target_geom)) if target_geom is not None else 0.0)
+            distances.append(float(source_point.distance(target_geom)) if target_geom is not None else 0.0)
         features.append(np.asarray(distances, dtype=np.float32))
         names.append("distance_to_flowpath_m")
 
@@ -580,8 +986,27 @@ def _map_grid_sources_to_flowpaths(payload: dict[str, Any], ngen: Mapping[str, A
         payload["runoff_source_features"] = torch.as_tensor(np.stack(features, axis=1), dtype=torch.float32)
         payload["runoff_source_feature_names"] = names
 
-    payload["metadata"] = dict(payload.get("metadata", {}), runoff_source_count=int(len(joined)))
-    logger.info("Mapped %s grid sources to %s graph nodes", len(joined), int(np.unique(target_index).size))
+    payload["metadata"] = dict(
+        payload.get("metadata", {}),
+        runoff_source_count=int(len(joined)),
+        runoff_source_unique_grid_cells=int(pd.Series(source_flat_index).nunique()),
+        runoff_source_mapping=mapping_label,
+        runoff_source_weight_kind=weight_kind,
+        runoff_source_fraction_kind="overlap_area_over_grid_cell_area",
+        runoff_mapping_method=method,
+        min_overlap_fraction=float(min_overlap_fraction),
+    )
+    fraction_sum = joined.groupby("source_flat_index")["overlap_fraction"].sum()
+    logger.info(
+        "Mapped %s runoff source rows from %s unique grid cells to %s graph nodes | method=%s | fraction_sum[min=%.4f, mean=%.4f, max=%.4f]",
+        len(joined),
+        int(fraction_sum.size),
+        int(np.unique(target_index).size),
+        method,
+        float(fraction_sum.min()),
+        float(fraction_sum.mean()),
+        float(fraction_sum.max()),
+    )
 
 
 def _component_ids(num_nodes: int, edge_index: torch.Tensor) -> np.ndarray:
@@ -617,7 +1042,14 @@ def main() -> None:
     if args.exclude_gauges:
         logger.info("Excluded gauges from graph mapping: %s", ",".join(str(value) for value in args.exclude_gauges))
     _map_gauges(payload, ngen, basin_ids, args.gauge_metadata, allow_missing=bool(args.allow_missing_gauges))
-    _map_grid_sources_to_flowpaths(payload, ngen, grid, list(dict.fromkeys(args.source_feature)))
+    _map_grid_sources_to_flowpaths(
+        payload,
+        ngen,
+        grid,
+        list(dict.fromkeys(args.source_feature)),
+        mapping_method=str(args.runoff_mapping_method),
+        min_overlap_fraction=float(args.min_overlap_fraction),
+    )
 
     comp = _component_ids(len(payload["node_ids"]), payload["edge_index"])
     metadata = dict(payload.get("metadata", {}))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -20,6 +21,30 @@ def _resolve_graph_tensor(graph: Mapping[str, Any], keys: Sequence[str]) -> Any 
         if key and key in graph:
             return graph[key]
     return None
+
+
+def _normalize_name(value: Any) -> str:
+    return str(value).strip().lower()
+
+
+def _coerce_name_sequence(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)):
+        text = str(value).strip()
+        if not text:
+            return ()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return tuple(str(item) for item in parsed)
+            except Exception:
+                pass
+        return (text,)
+    if isinstance(value, Sequence):
+        return tuple(str(item) for item in value)
+    return ()
 
 
 def _target_weight_normalize(
@@ -58,12 +83,35 @@ class GridToGraphRunoffTransfer(nn.Module):
         hidden_dim: int = 16,
         normalize_by_target: bool = False,
         weight_activation: str = "sigmoid_scale",
+        weight_strategy: str = "stored",
+        source_feature_names_key: str = "runoff_source_feature_names",
+        target_feature_key: str = "node_features",
+        target_feature_names_key: str = "node_feature_names",
+        cell_area_feature_name: str = "cell_area_m2",
+        distance_feature_name: str = "distance_to_flowpath_m",
+        source_elevation_feature_name: str = "elevation",
+        target_elevation_feature_names: Sequence[str] | None = None,
+        preserve_base_weight_sum: bool = True,
+        distance_scale_m: float | None = None,
         sanitize_nonfinite: bool = True,
     ):
         super().__init__()
         self.mode = str(mode).lower()
         if self.mode not in {"fixed", "neural", "learned"}:
             raise ValueError("runoff_transfer.mode must be one of: fixed, neural")
+        self.weight_strategy = str(weight_strategy or "stored").lower()
+        if self.weight_strategy not in {
+            "stored",
+            "cell_area",
+            "inverse_distance",
+            "exp_distance",
+            "downhill",
+            "downhill_distance",
+        }:
+            raise ValueError(
+                "runoff_transfer.weight_strategy must be one of: "
+                "stored, cell_area, inverse_distance, exp_distance, downhill, downhill_distance"
+            )
         self.graph_key = str(graph_key)
         self.output_keys = tuple(str(key) for key in output_keys or ())
         self.source_index_key = str(source_index_key)
@@ -71,6 +119,16 @@ class GridToGraphRunoffTransfer(nn.Module):
         self.target_index_key = str(target_index_key)
         self.weight_key = str(weight_key)
         self.source_feature_key = str(source_feature_key)
+        self.source_feature_names_key = str(source_feature_names_key)
+        self.target_feature_key = str(target_feature_key)
+        self.target_feature_names_key = str(target_feature_names_key)
+        self.cell_area_feature_name = str(cell_area_feature_name)
+        self.distance_feature_name = str(distance_feature_name)
+        self.source_elevation_feature_name = str(source_elevation_feature_name)
+        target_elevation_feature_names = target_elevation_feature_names or ("node_dem_elevation_m", "mean.elevation")
+        self.target_elevation_feature_names = tuple(str(value) for value in target_elevation_feature_names)
+        self.preserve_base_weight_sum = bool(preserve_base_weight_sum)
+        self.distance_scale_m = None if distance_scale_m in {None, 0} else float(distance_scale_m)
         self.normalize_by_target = bool(normalize_by_target)
         self.weight_activation = str(weight_activation).lower()
         self.sanitize_nonfinite = bool(sanitize_nonfinite)
@@ -96,8 +154,216 @@ class GridToGraphRunoffTransfer(nn.Module):
                     raise ValueError(
                         "runoff_transfer.type='neural' requires runoff_source_features "
                         "or a known source_count for per-source weights"
-                    )
+                )
                 self.source_logits = nn.Parameter(torch.zeros(int(source_count)))
+
+    def _feature_index(self, names: Sequence[str], requested_names: Sequence[str]) -> int | None:
+        normalized = {_normalize_name(name): idx for idx, name in enumerate(names)}
+        for requested in requested_names:
+            if _normalize_name(requested) in normalized:
+                return int(normalized[_normalize_name(requested)])
+        return None
+
+    def _metadata(self, graph: Mapping[str, Any]) -> Mapping[str, Any]:
+        metadata = graph.get("metadata", {})
+        return metadata if isinstance(metadata, Mapping) else {}
+
+    def _source_feature_vector(
+        self,
+        graph: Mapping[str, Any],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        requested_names: Sequence[str],
+    ) -> torch.Tensor | None:
+        raw = _resolve_graph_tensor(graph, (self.source_feature_key, "runoff_source_features"))
+        if raw is None:
+            return None
+        features = torch.as_tensor(raw, dtype=dtype, device=device)
+        if features.ndim == 1:
+            features = features.unsqueeze(-1)
+        names_raw = graph.get(self.source_feature_names_key, graph.get("runoff_source_feature_names", ()))
+        names = _coerce_name_sequence(names_raw)
+        index = self._feature_index(names, requested_names)
+        if index is None:
+            return None
+        return features[:, index].reshape(-1)
+
+    def _target_feature_vector(
+        self,
+        graph: Mapping[str, Any],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        requested_names: Sequence[str],
+    ) -> torch.Tensor | None:
+        raw = _resolve_graph_tensor(graph, (self.target_feature_key, "node_features"))
+        if raw is None:
+            return None
+        features = torch.as_tensor(raw, dtype=dtype, device=device)
+        if features.ndim == 1:
+            features = features.unsqueeze(-1)
+        names_raw = graph.get(self.target_feature_names_key)
+        if names_raw is None:
+            names_raw = self._metadata(graph).get(
+                self.target_feature_names_key,
+                self._metadata(graph).get("node_feature_names", ()),
+            )
+        names = _coerce_name_sequence(names_raw)
+        index = self._feature_index(names, requested_names)
+        if index is None:
+            return None
+        return features[:, index].reshape(-1)
+
+    def _cell_scale_m(
+        self,
+        graph: Mapping[str, Any],
+        base_weights: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        cell_area = self._source_feature_vector(
+            graph,
+            device=device,
+            dtype=dtype,
+            requested_names=(self.cell_area_feature_name,),
+        )
+        if cell_area is None:
+            cell_area = base_weights
+        return torch.sqrt(torch.clamp(cell_area, min=torch.finfo(dtype).eps))
+
+    def _preserve_weight_sum(
+        self,
+        base_weights: torch.Tensor,
+        candidate_weights: torch.Tensor,
+        target_index: torch.Tensor,
+        *,
+        num_targets: int,
+    ) -> torch.Tensor:
+        eps = torch.finfo(candidate_weights.dtype).eps
+        base_sum = torch.zeros(num_targets, dtype=base_weights.dtype, device=base_weights.device)
+        cand_sum = torch.zeros(num_targets, dtype=candidate_weights.dtype, device=candidate_weights.device)
+        base_sum.scatter_add_(0, target_index, base_weights)
+        cand_sum.scatter_add_(0, target_index, candidate_weights)
+
+        fallback_targets = cand_sum <= eps
+        if bool(fallback_targets.any()):
+            candidate_weights = torch.where(fallback_targets.index_select(0, target_index), base_weights, candidate_weights)
+            cand_sum.zero_()
+            cand_sum.scatter_add_(0, target_index, candidate_weights)
+
+        scale = base_sum / cand_sum.clamp_min(eps)
+        return candidate_weights * scale.index_select(0, target_index)
+
+    def _resolve_transfer_weights(
+        self,
+        graph: Mapping[str, Any],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        base_weights: torch.Tensor,
+        target_index: torch.Tensor,
+        num_targets: int,
+    ) -> torch.Tensor:
+        strategy = self.weight_strategy
+        if strategy == "stored":
+            return base_weights
+
+        cell_area = self._source_feature_vector(
+            graph,
+            device=device,
+            dtype=dtype,
+            requested_names=(self.cell_area_feature_name,),
+        )
+        if cell_area is None:
+            cell_area = base_weights
+
+        candidate_weights: torch.Tensor
+        if strategy == "cell_area":
+            candidate_weights = cell_area
+        elif strategy in {"inverse_distance", "exp_distance"}:
+            distance = self._source_feature_vector(
+                graph,
+                device=device,
+                dtype=dtype,
+                requested_names=(self.distance_feature_name,),
+            )
+            if distance is None:
+                raise KeyError(
+                    f"runoff_transfer.weight_strategy='{strategy}' requires source feature "
+                    f"'{self.distance_feature_name}' in routing_graph['{self.source_feature_key}']"
+                )
+            distance = torch.maximum(
+                distance,
+                self._cell_scale_m(graph, base_weights, device=device, dtype=dtype),
+            )
+            if strategy == "inverse_distance":
+                factor = 1.0 / distance
+            else:
+                scale = self.distance_scale_m
+                if scale is None or scale <= 0.0:
+                    finite_distance = distance[torch.isfinite(distance)]
+                    scale = float(finite_distance.median().item()) if int(finite_distance.numel()) else 1.0
+                factor = torch.exp(-distance / max(scale, torch.finfo(dtype).eps))
+            candidate_weights = cell_area * factor
+        elif strategy in {"downhill", "downhill_distance"}:
+            source_elevation = self._source_feature_vector(
+                graph,
+                device=device,
+                dtype=dtype,
+                requested_names=(self.source_elevation_feature_name,),
+            )
+            if source_elevation is None:
+                raise KeyError(
+                    f"runoff_transfer.weight_strategy='{strategy}' requires source feature "
+                    f"'{self.source_elevation_feature_name}' in routing_graph['{self.source_feature_key}']"
+                )
+            target_elevation = self._target_feature_vector(
+                graph,
+                device=device,
+                dtype=dtype,
+                requested_names=self.target_elevation_feature_names,
+            )
+            if target_elevation is None:
+                raise KeyError(
+                    f"runoff_transfer.weight_strategy='{strategy}' requires a node feature named one of "
+                    f"{list(self.target_elevation_feature_names)} in routing_graph['{self.target_feature_key}']"
+                )
+            elevation_drop = torch.clamp(source_elevation - target_elevation.index_select(0, target_index), min=0.0)
+            if strategy == "downhill":
+                factor = elevation_drop
+            else:
+                distance = self._source_feature_vector(
+                    graph,
+                    device=device,
+                    dtype=dtype,
+                    requested_names=(self.distance_feature_name,),
+                )
+                if distance is None:
+                    raise KeyError(
+                        f"runoff_transfer.weight_strategy='{strategy}' requires source feature "
+                        f"'{self.distance_feature_name}' in routing_graph['{self.source_feature_key}']"
+                    )
+                distance = torch.maximum(
+                    distance,
+                    self._cell_scale_m(graph, base_weights, device=device, dtype=dtype),
+                )
+                factor = elevation_drop / distance
+            candidate_weights = cell_area * factor
+        else:
+            raise ValueError(f"Unsupported runoff transfer weight_strategy '{strategy}'")
+
+        if self.sanitize_nonfinite:
+            candidate_weights = torch.nan_to_num(candidate_weights, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.preserve_base_weight_sum:
+            candidate_weights = self._preserve_weight_sum(
+                base_weights,
+                candidate_weights,
+                target_index,
+                num_targets=num_targets,
+            )
+        return candidate_weights
 
     def _resolve_mapping(
         self,
@@ -249,7 +515,15 @@ class GridToGraphRunoffTransfer(nn.Module):
             dtype=tensor.dtype,
         )
         source_count = int(target_index.numel())
-        weights = base_weights * self._source_multipliers(
+        weights = self._resolve_transfer_weights(
+            graph,
+            device=tensor.device,
+            dtype=tensor.dtype,
+            base_weights=base_weights,
+            target_index=target_index,
+            num_targets=num_targets,
+        )
+        weights = weights * self._source_multipliers(
             graph,
             device=tensor.device,
             dtype=tensor.dtype,

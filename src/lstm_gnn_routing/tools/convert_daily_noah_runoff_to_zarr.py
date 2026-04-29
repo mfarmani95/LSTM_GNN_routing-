@@ -34,7 +34,35 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-time", type=int, default=64)
     parser.add_argument("--chunk-y", type=int, default=128)
     parser.add_argument("--chunk-x", type=int, default=128)
+    parser.add_argument(
+        "--add-total-runoff",
+        action="store_true",
+        help="Write an additional runoff_total variable equal to RUNSF + RUNSB after missing values are masked.",
+    )
+    parser.add_argument(
+        "--total-runoff-name",
+        default="runoff_total",
+        help="Variable name to use when --add-total-runoff is enabled.",
+    )
     return parser
+
+
+def _missing_sentinels(da: xr.DataArray, ds: xr.Dataset) -> list[np.float32]:
+    sentinels: list[np.float32] = []
+    for mapping in (dict(ds.attrs), dict(da.attrs), dict(getattr(da, "encoding", {}) or {})):
+        for key in ("missing_value", "_FillValue", "fill_value"):
+            value = mapping.get(key)
+            if value is None:
+                continue
+            values = np.asarray(value).reshape(-1)
+            for item in values:
+                if np.isfinite(item):
+                    sentinels.append(np.float32(item))
+    unique = []
+    for value in sentinels:
+        if not any(np.isclose(value, existing, equal_nan=False) for existing in unique):
+            unique.append(value)
+    return unique
 
 
 def _collect_year_groups(input_dir: Path, glob_pattern: str) -> dict[int, list[tuple[pd.Timestamp, Path]]]:
@@ -53,6 +81,8 @@ def _load_year_dataset(
     entries: list[tuple[pd.Timestamp, Path]],
     *,
     variables: list[str],
+    add_total_runoff: bool = False,
+    total_runoff_name: str = "runoff_total",
 ) -> xr.Dataset:
     if not entries:
         raise ValueError("Cannot build a yearly runoff dataset from zero files")
@@ -78,10 +108,10 @@ def _load_year_dataset(
             for name in variables:
                 if name not in ds:
                     raise KeyError(f"Variable '{name}' not found in {path}")
-                values = np.asarray(ds[name].to_numpy(), dtype=np.float32)
-                missing_value = ds[name].attrs.get("missing_value", ds.attrs.get("missing_value"))
-                if missing_value is not None:
-                    values = np.where(values == np.float32(missing_value), np.nan, values)
+                da = ds[name]
+                values = np.asarray(da.to_numpy(), dtype=np.float32)
+                for sentinel in _missing_sentinels(da, ds):
+                    values = np.where(np.isclose(values, sentinel, equal_nan=False), np.nan, values)
                 arrays[name][time_index] = values * np.float32(SECONDS_PER_DAY)
         finally:
             ds.close()
@@ -95,6 +125,22 @@ def _load_year_dataset(
             "conversion": "daily_mean_rate_times_86400",
         }
         data_vars[name] = (("time", "y", "x"), arrays[name], attrs)
+
+    if add_total_runoff:
+        required = {"RUNSF", "RUNSB"}
+        if not required.issubset(arrays):
+            missing = sorted(required.difference(arrays))
+            raise ValueError(
+                f"--add-total-runoff requires variables {sorted(required)}, missing {missing}"
+            )
+        total = arrays["RUNSF"] + arrays["RUNSB"]
+        total_attrs = {
+            "long_name": "Total daily runoff depth",
+            "units": "mm/day",
+            "components": "RUNSF,RUNSB",
+            "conversion": "daily_mean_rate_times_86400_then_sum",
+        }
+        data_vars[str(total_runoff_name)] = (("time", "y", "x"), total.astype(np.float32, copy=False), total_attrs)
 
     return xr.Dataset(
         data_vars=data_vars,
@@ -136,7 +182,12 @@ def main(argv: list[str] | None = None) -> None:
 
         entries = sorted(year_groups[year], key=lambda item: item[0])
         print(f"[convert] {year}: {len(entries)} daily files -> {store_path}")
-        ds = _load_year_dataset(entries, variables=list(args.variables))
+        ds = _load_year_dataset(
+            entries,
+            variables=list(args.variables),
+            add_total_runoff=bool(args.add_total_runoff),
+            total_runoff_name=str(args.total_runoff_name),
+        )
         try:
             chunk_time = min(int(args.chunk_time), int(ds.sizes["time"]))
             ds = ds.chunk({"time": max(chunk_time, 1), "y": int(args.chunk_y), "x": int(args.chunk_x)})

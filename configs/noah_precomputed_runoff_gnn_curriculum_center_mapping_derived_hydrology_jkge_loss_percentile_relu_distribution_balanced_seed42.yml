@@ -1,0 +1,228 @@
+experiment_name: "distribution_balanced_gat_original_edges_jkge_seed42"
+run_dir: "runs/distribution_balanced/gat_original_edges/jkge/seed42"
+device: "cuda"
+dtype: "float32"
+
+train_start_date: "1991-01-01 00:00:00"
+train_end_date: "2011-01-02 23:00:00"
+validation_start_date: "1981-01-01 00:00:00"
+validation_end_date: "1991-01-02 23:00:00"
+test_start_date: "2011-01-01 00:00:00"
+test_end_date: "2022-01-02 23:00:00"
+
+data_dir: "data"
+train_basin_file: "data/streamflow/26_basin_ids_ngen.txt"
+validation_basin_file: "data/streamflow/26_basin_ids_ngen.txt"
+test_basin_file: "data/streamflow/26_basin_ids_ngen.txt"
+
+io_mode: "lazy"
+memory_safety_factor: 0.65
+preload_static: true
+preload_targets: true
+normalize_data: false
+save_scaler: false
+
+scaler:
+  path: "scalers/noah_post_transfer_runoff_scaler_center_mapping_derived_hydrology_stage5_percentile_relu_jkge_distribution_balanced_seed42.yml"
+  save: true
+
+# Diagnostic split: non-overlapping 180-day blocks balanced by observed streamflow distribution.
+data_split:
+  type: "precomputed_blocks"
+  file: "data/splits/streamflow_distribution_balanced_blocks_180d_seed42.yml"
+  merge_adjacent_blocks: true
+  merge_gap_days: 0
+
+loading:
+  show_progress: true
+  leave_progress: false
+
+execution:
+  mode: "unified"
+  runoff_model_device: "cuda"
+  routing_device: "cuda"
+
+forcing:
+  dir: "/xdisk/behrangi/farmani/Runoff_daily_v2/"
+  variables: ["RUNSF", "RUNSB"]
+  file_mode: "multi_zarr_yearly"
+  time_dim: "time"
+  y_dim: "y"
+  x_dim: "x"
+  open_kwargs:
+    consolidated: true
+
+static:
+  dir: "data/static"
+  variables: ["LAT2D", "LON2D", "landmask", "BOTSOIL2D", "VEG2D"]
+  file_mode: "per_variable"
+  var_to_file_map:
+    LAT2D: "data/static/lon_lat.nc"
+    LON2D: "data/static/lon_lat.nc"
+    landmask: "data/static/landmask.nc"
+    BOTSOIL2D: "data/static/botsoil30s_res.nc"
+    VEG2D: "data/static/veg30s_res.nc"
+  open_kwargs: {}
+
+targets:
+  dir: "data/streamflow/daily"
+  variables: ["QQobs"]
+  file_pattern: "{basin_id}.csv"
+  date_column: "Date"
+  separator: ","
+  basin_id_column: "basin_id"
+  unit_conversion: "auto"
+  normalize: true
+  transform: "identity"
+  scaling: "percentile_minmax"
+  lower_percentile: 1.0
+  upper_percentile: 99.0
+  clip_normalized: true
+  scaler_group: "streamflow_percentile_minmax_p01_p99"
+
+routing:
+  graph:
+    mode: "load"
+    file_path: "data/graphs/routing_graph_ngen_salt_verde_center_mapping_derived_hydrology.nc"
+    compact_routing_domain: true
+    full_domain_outlet_gauges: ["09511300", "09510000", "09510200"]
+    expected_independent_components: 3
+  dynamic:
+    source: "forcing"
+    variables: ["RUNSF", "RUNSB"]
+    normalize: false
+    include_spinup: false
+
+runoff_transfer:
+  enabled: true
+  type: "fixed"
+  weight_strategy: "stored"
+  graph_key: "routing_graph"
+  output_keys: ["runoff_total"]
+  source_flat_index_key: "runoff_source_flat_index"
+  target_index_key: "runoff_target_index"
+  weight_key: "runoff_source_weight"
+  source_feature_names_key: "runoff_source_feature_names"
+  target_feature_key: "node_features"
+  target_feature_names_key: "node_feature_names"
+  cell_area_feature_name: "cell_area_m2"
+  distance_feature_name: "distance_to_flowpath_m"
+  source_elevation_feature_name: "elevation"
+  target_elevation_feature_names: ["node_dem_elevation_m", "mean.elevation"]
+  preserve_base_weight_sum: true
+  distance_scale_m:
+  normalize_by_target: false
+  sanitize_nonfinite: true
+
+runoff_model:
+  type: "precomputed"
+  dynamic_input_keys: ["x_routing_dynamic"]
+  output_keys: ["runoff_total"]
+  sanitize_nonfinite: true
+
+routing_model:
+  type: "gnn"
+  conv_type: "GAT"
+  hidden_dim: 64
+  num_layers: 4
+  gat_heads: 4
+  temporal_graph_batch_size: 32
+  dropout: 0.1
+  output_dim: 1
+  temporal_reduction: "none"
+  runoff_output_keys: ["runoff_total"]
+  runoff_input_transform: "identity"
+  normalize_runoff_inputs: true
+  runoff_scaler_group: "routing_runoff_post_transfer"
+  runoff_lags: [0, 1, 2, 3, 7, 14]
+  routing_lag_context_days: 14
+  runoff_lag_fill: "zero"
+  static_input_keys: []
+  dynamic_input_keys: []
+  graph_key: "routing_graph"
+  graph_node_feature_key: "node_features"
+  edge_attr_key: "edge_attr"
+  normalize_edge_attr: true
+  drop_constant_edge_attr: true
+  sanitize_nonfinite: true
+  normalize_graph_node_features: true
+  temporal_head: "conv1d"
+  temporal_head_kernel_size: 7
+  temporal_head_layers: 2
+  temporal_head_hidden_dim: 16
+  temporal_head_residual: true
+  output_activation: "relu"
+  feature_clip: 20.0
+  gauge_index_key: "gauge_index"
+
+batch_size: 1
+num_workers: 0
+
+windowing:
+  sequence_days: 180
+  stride_days: 30
+  apply_to_validation_test: true
+
+curriculum:
+  enabled: true
+  early_stopping_scope: "stage"
+  stage_learning_rate_decay: 0.7
+  independent_outlet_gauges: ["09511300", "09510000", "09510200"]
+  gauge_weights:
+    "09499000": 1.5
+    "09506000": 1.25
+    "09507980": 1.25
+    "09508300": 1.25
+    "09508500": 2.5
+    "09510200": 2.0
+    "09498500": 2.5
+  stages:
+    - name: "stage_1_headwaters_parallel"
+      gauges: ["09489500", "09510200", "09504000", "09503700"]
+      epochs: 40
+    - name: "stage_2_midstream_parallel"
+      gauges: ["09489500", "09490500", "09510200", "09503700", "09504000", "09504420", "09504500", "09505350", "09505200", "09505800", "09506000"]
+      epochs: 50
+    - name: "stage_3_branch_constraints_parallel"
+      gauges: ["09489500", "09490500", "09497500", "09492400", "09496500", "09494000", "09503700", "09504000", "09504420", "09504500", "09505350", "09505200", "09505800", "09506000", "09507980", "09508300", "09508500", "09510200"]
+      epochs: 60
+    - name: "stage_4_outlet_integration_parallel"
+      gauges: ["09489500", "09490500", "09497500", "09492400", "09496500", "09494000", "09498500", "09498400", "09497980", "09497800", "09499000", "09503700", "09504000", "09504420", "09504500", "09505350", "09505200", "09505800", "09506000", "09507980", "09508300", "09508500", "09510200"]
+      epochs: 120
+      learning_rate: 0.00025
+
+training:
+  loss: "jkge"
+  loss_target_space: "physical"
+  jkge_benchmark: "moving_average"
+  jkge_window: 31
+  jkge_eps: 1.0e-8
+  learning_rate: 0.001
+  optimizer: "adamw"
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.0002
+  use_amp: false
+  skip_nonfinite_batches: true
+  show_progress: true
+  leave_progress: false
+  default_prediction_key: "runoff_total"
+  target_key: "y"
+  seed: 42
+
+checkpoint:
+  enabled: true
+  save_best: true
+  save_last: true
+  save_stage_best: true
+  save_final_stage_best: true
+  restore_stage_best: true
+  restore_stage_best_optimizer: true
+  best_file: "best_model.pt"
+  last_file: "last_model.pt"
+  stage_best_file_template: "best_stage_{stage_index}_{stage_name}.pt"
+  final_stage_best_file: "best_final_stage_model.pt"
+
+evaluation:
+  metrics: ["mse", "rmse", "kge", "nse"]

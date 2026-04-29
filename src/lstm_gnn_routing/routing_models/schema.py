@@ -166,6 +166,10 @@ def normalize_routing_graph_payload(
     if runoff_source_weight is not None:
         graph["runoff_source_weight"] = _to_float_tensor(runoff_source_weight, dtype).reshape(-1)
 
+    runoff_source_fraction = _resolve_alias(raw, "runoff_source_fraction", "source_fraction", "grid_to_node_fraction")
+    if runoff_source_fraction is not None:
+        graph["runoff_source_fraction"] = _to_float_tensor(runoff_source_fraction, dtype).reshape(-1)
+
     runoff_source_features = _resolve_alias(
         raw,
         "runoff_source_features",
@@ -207,7 +211,7 @@ def normalize_routing_graph_payload(
         source_count = int(graph["runoff_target_index"].numel())
         if source_count and int(graph["runoff_target_index"].max().item()) >= num_nodes:
             raise ValueError("runoff_target_index contains node ids outside the routing graph")
-        for key in ("runoff_source_index", "runoff_source_flat_index", "runoff_source_weight"):
+        for key in ("runoff_source_index", "runoff_source_flat_index", "runoff_source_weight", "runoff_source_fraction"):
             if key in graph and int(graph[key].numel()) != source_count:
                 raise ValueError(f"{key} length must match runoff_target_index length {source_count}")
         if "runoff_source_features" in graph and int(graph["runoff_source_features"].shape[0]) != source_count:
@@ -230,3 +234,87 @@ def normalize_routing_graph_payload(
         metadata["grid_shape"] = graph["grid_shape"]
     graph["metadata"] = metadata
     return graph
+
+
+def preprocess_routing_graph_edge_features(
+    graph: Mapping[str, Any],
+    *,
+    edge_attr_key: str = "edge_attr",
+    edge_feature_names_key: str = "edge_feature_names",
+    include_names: Sequence[str] | None = None,
+    exclude_names: Sequence[str] | None = None,
+    drop_constant: bool = False,
+    normalize: bool = False,
+    constant_tol: float = 1.0e-12,
+) -> dict[str, Any]:
+    processed = dict(graph)
+    if edge_attr_key not in processed:
+        return processed
+
+    edge_attr = torch.as_tensor(processed[edge_attr_key])
+    if edge_attr.ndim == 1:
+        edge_attr = edge_attr.unsqueeze(-1)
+    if edge_attr.ndim != 2:
+        raise ValueError(f"{edge_attr_key} must have shape [E, C], got {tuple(edge_attr.shape)}")
+
+    dtype = edge_attr.dtype if edge_attr.is_floating_point() else torch.float32
+    edge_attr = edge_attr.to(dtype=dtype)
+    feature_count = int(edge_attr.shape[1])
+
+    raw_names = list(processed.get(edge_feature_names_key, []) or [])
+    feature_names = [
+        str(raw_names[idx]) if idx < len(raw_names) and str(raw_names[idx]).strip() else f"edge_feature_{idx}"
+        for idx in range(feature_count)
+    ]
+
+    keep_mask = torch.ones(feature_count, dtype=torch.bool)
+    if include_names:
+        include = {str(value) for value in include_names}
+        keep_mask &= torch.tensor([name in include for name in feature_names], dtype=torch.bool)
+    if exclude_names:
+        exclude = {str(value) for value in exclude_names}
+        keep_mask &= torch.tensor([name not in exclude for name in feature_names], dtype=torch.bool)
+
+    edge_attr_stats = edge_attr.to(dtype=torch.float32)
+    std = edge_attr_stats.std(dim=0, unbiased=False)
+    constant_mask = std <= float(constant_tol)
+    if drop_constant:
+        keep_mask &= ~constant_mask
+
+    kept_indices = torch.nonzero(keep_mask, as_tuple=False).reshape(-1)
+    dropped_constant_names = [feature_names[idx] for idx in torch.nonzero(constant_mask, as_tuple=False).reshape(-1).tolist()]
+    if kept_indices.numel() == 0:
+        processed.pop(edge_attr_key, None)
+        processed[edge_feature_names_key] = []
+        metadata = dict(processed.get("metadata", {}) or {})
+        metadata["edge_attr_preprocessing"] = {
+            "normalize": bool(normalize),
+            "drop_constant": bool(drop_constant),
+            "constant_tol": float(constant_tol),
+            "kept_features": [],
+            "dropped_constant_features": dropped_constant_names,
+        }
+        processed["metadata"] = metadata
+        return processed
+
+    edge_attr = edge_attr.index_select(1, kept_indices)
+    kept_feature_names = [feature_names[idx] for idx in kept_indices.tolist()]
+
+    if normalize:
+        edge_attr_stats = edge_attr.to(dtype=torch.float32)
+        mean = edge_attr_stats.mean(dim=0, keepdim=True)
+        std = edge_attr_stats.std(dim=0, unbiased=False, keepdim=True).clamp_min(float(constant_tol))
+        edge_attr = ((edge_attr_stats - mean) / std).to(dtype=edge_attr.dtype)
+
+    processed[edge_attr_key] = edge_attr
+    processed[edge_feature_names_key] = kept_feature_names
+    metadata = dict(processed.get("metadata", {}) or {})
+    metadata["edge_attr_preprocessing"] = {
+        "normalize": bool(normalize),
+        "drop_constant": bool(drop_constant),
+        "constant_tol": float(constant_tol),
+        "kept_features": kept_feature_names,
+        "dropped_constant_features": dropped_constant_names,
+    }
+    processed["metadata"] = metadata
+    return processed

@@ -131,6 +131,18 @@ def build_runoff_transfer_model(config, *, example_batch: Mapping[str, Any] | No
         hidden_dim=int(transfer_cfg.get("hidden_dim", 16)),
         normalize_by_target=bool(transfer_cfg.get("normalize_by_target", False)),
         weight_activation=str(transfer_cfg.get("weight_activation", "sigmoid_scale")),
+        weight_strategy=str(transfer_cfg.get("weight_strategy", "stored")),
+        source_feature_names_key=str(transfer_cfg.get("source_feature_names_key", "runoff_source_feature_names")),
+        target_feature_key=str(transfer_cfg.get("target_feature_key", "node_features")),
+        target_feature_names_key=str(transfer_cfg.get("target_feature_names_key", "node_feature_names")),
+        cell_area_feature_name=str(transfer_cfg.get("cell_area_feature_name", "cell_area_m2")),
+        distance_feature_name=str(transfer_cfg.get("distance_feature_name", "distance_to_flowpath_m")),
+        source_elevation_feature_name=str(transfer_cfg.get("source_elevation_feature_name", "elevation")),
+        target_elevation_feature_names=tuple(
+            transfer_cfg.get("target_elevation_feature_names", ["node_dem_elevation_m", "mean.elevation"])
+        ),
+        preserve_base_weight_sum=bool(transfer_cfg.get("preserve_base_weight_sum", True)),
+        distance_scale_m=transfer_cfg.get("distance_scale_m"),
         sanitize_nonfinite=bool(transfer_cfg.get("sanitize_nonfinite", True)),
     )
     return model.to(device=device) if device is not None else model
@@ -234,5 +246,7 @@ def build_routing_model(config, *, example_batch: Mapping[str, Any], device=None
         temporal_head_residual=bool(routing_cfg.get("temporal_head_residual", True)),
         output_activation=str(routing_cfg.get("output_activation", "none")),
         feature_clip=routing_cfg.get("feature_clip", 10.0),
+        edge_mp_use_gate=bool(routing_cfg.get("edge_mp_use_gate", True)),
+        edge_mp_aggregation=str(routing_cfg.get("edge_mp_aggregation", "sum")),
     )
     return model.to(device=device) if device is not None else model
