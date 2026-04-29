@@ -461,8 +461,11 @@ def export_routing_graph_netcdf(payload: Mapping[str, Any], file_path: str | Pat
     node_features = payload.get("node_features")
     if node_features is not None:
         node_features_np = torch.as_tensor(node_features, dtype=torch.float32).cpu().numpy()
+        node_feature_names = list(payload.get("node_feature_names", []) or [])
         coords["node_feature"] = np.asarray(
-            [f"node_feature_{idx}" for idx in range(node_features_np.shape[1])],
+            node_feature_names
+            if node_feature_names
+            else [f"node_feature_{idx}" for idx in range(node_features_np.shape[1])],
             dtype=str,
         )
         data_vars["node_features"] = (("node", "node_feature"), node_features_np)
@@ -498,6 +501,12 @@ def export_routing_graph_netcdf(payload: Mapping[str, Any], file_path: str | Pat
             data_vars["runoff_source_weight"] = (
                 ("runoff_source",),
                 torch.as_tensor(runoff_source_weight, dtype=torch.float32).cpu().numpy(),
+            )
+        runoff_source_fraction = payload.get("runoff_source_fraction")
+        if runoff_source_fraction is not None:
+            data_vars["runoff_source_fraction"] = (
+                ("runoff_source",),
+                torch.as_tensor(runoff_source_fraction, dtype=torch.float32).cpu().numpy(),
             )
         runoff_source_features = payload.get("runoff_source_features")
         if runoff_source_features is not None:

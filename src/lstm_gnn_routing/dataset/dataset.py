@@ -1,4 +1,5 @@
 import itertools
+import json
 import logging
 import pickle
 import sys
@@ -13,7 +14,10 @@ from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
 from lstm_gnn_routing.routing_models.graph_builder import build_routing_graph_payload, export_routing_graph_netcdf
-from lstm_gnn_routing.routing_models.schema import normalize_routing_graph_payload
+from lstm_gnn_routing.routing_models.schema import (
+    normalize_routing_graph_payload,
+    preprocess_routing_graph_edge_features,
+)
 from lstm_gnn_routing.utils.config import RoutingConfig
 from lstm_gnn_routing.utils.data import (
     decide_io_mode,
@@ -226,6 +230,8 @@ def _load_graph_payload(file_path: Path, dtype: torch.dtype) -> Any:
                 payload["edge_weight"] = np.asarray(ds["edge_weight"].values, dtype=np.float32)
             if "node_features" in ds:
                 payload["node_features"] = np.asarray(ds["node_features"].values, dtype=np.float32)
+                if "node_feature" in ds.coords:
+                    payload["node_feature_names"] = [str(value) for value in ds.coords["node_feature"].values.tolist()]
             if "gauge_index" in ds:
                 payload["gauge_index"] = np.asarray(ds["gauge_index"].values, dtype=np.int64)
             if "gauge_id" in ds:
@@ -238,6 +244,8 @@ def _load_graph_payload(file_path: Path, dtype: torch.dtype) -> Any:
                 payload["runoff_source_flat_index"] = np.asarray(ds["runoff_source_flat_index"].values, dtype=np.int64)
             if "runoff_source_weight" in ds:
                 payload["runoff_source_weight"] = np.asarray(ds["runoff_source_weight"].values, dtype=np.float32)
+            if "runoff_source_fraction" in ds:
+                payload["runoff_source_fraction"] = np.asarray(ds["runoff_source_fraction"].values, dtype=np.float32)
             if "runoff_source_features" in ds:
                 payload["runoff_source_features"] = np.asarray(ds["runoff_source_features"].values, dtype=np.float32)
                 if "runoff_source_feature" in ds.coords:
@@ -337,6 +345,8 @@ class RoutingDataset(Dataset):
         self.prediction_context_days = max(self.routing_lag_context_days, self.runoff_warmup_days)
 
         self.basin_ids = self._load_basin_ids(period)
+        self.data_split_cfg = config.section("data_split")
+        self.split_blocks = self._load_precomputed_split_blocks(period)
         self.period_start, self.period_end = self._get_period_dates(period)
 
         self.forcing_io_mode: Optional[str] = None
@@ -575,12 +585,79 @@ class RoutingDataset(Dataset):
         return load_basin_file(basin_file)
 
     def _get_period_dates(self, period: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+        if self.split_blocks:
+            block_starts = [pd.Timestamp(block["start"]) for block in self.split_blocks]
+            block_ends = [pd.Timestamp(block["end"]) for block in self.split_blocks]
+            period_start = min(block_starts)
+            if self.prediction_context_days > 0:
+                period_start = period_start - pd.DateOffset(days=int(self.prediction_context_days))
+            return period_start, max(block_ends)
+
         mapping = {
             "train": (self.config.train_start_date, self.config.train_end_date),
             "validation": (self.config.validation_start_date, self.config.validation_end_date),
             "test": (self.config.test_start_date, self.config.test_end_date),
         }
         return mapping[period]
+
+    def _load_precomputed_split_blocks(self, period: str) -> list[dict[str, Any]]:
+        split_type = str(self.data_split_cfg.get("type", "")).lower()
+        if split_type in {"", "none", "chronological", "date_range"}:
+            return []
+        if split_type not in {"precomputed_blocks", "distribution_balanced_blocks"}:
+            raise ValueError(
+                "data_split.type must be one of: chronological, precomputed_blocks, "
+                "distribution_balanced_blocks"
+            )
+
+        split_file = self.data_split_cfg.get("file", self.data_split_cfg.get("path"))
+        if split_file in (None, ""):
+            raise ValueError("data_split.file is required when using precomputed block splits.")
+        split_path = Path(split_file)
+        if not split_path.is_file():
+            raise FileNotFoundError(f"Precomputed data split file not found: {split_path}")
+
+        from ruamel.yaml import YAML
+
+        with split_path.open("r") as fp:
+            payload = YAML(typ="safe").load(fp) or {}
+
+        raw_blocks = payload.get("blocks")
+        if not isinstance(raw_blocks, list):
+            raise ValueError(f"Split file {split_path} must contain a YAML list named 'blocks'.")
+
+        selected: list[dict[str, Any]] = []
+        for raw_block in raw_blocks:
+            if not isinstance(raw_block, dict):
+                raise ValueError(f"Every block in {split_path} must be a mapping.")
+            block_period = str(raw_block.get("period", "")).lower()
+            if block_period == "val":
+                block_period = "validation"
+            if block_period != period:
+                continue
+            start = pd.Timestamp(raw_block.get("start"))
+            end = pd.Timestamp(raw_block.get("end"))
+            if pd.isna(start) or pd.isna(end) or end <= start:
+                raise ValueError(f"Invalid block start/end in {split_path}: {raw_block}")
+            selected.append(
+                {
+                    "block_id": int(raw_block.get("block_id", raw_block.get("id", len(selected)))),
+                    "start": start,
+                    "end": end,
+                    "period": period,
+                }
+            )
+
+        if not selected:
+            raise ValueError(f"No blocks assigned to period='{period}' in split file {split_path}.")
+
+        logger.info(
+            "Loaded %s precomputed split blocks for period='%s' from %s",
+            len(selected),
+            period,
+            split_path,
+        )
+        return sorted(selected, key=lambda block: (block["start"], block["end"]))
 
     def _load_all(self):
         logger.info("Loading routing dataset for period='%s'", self.period)
@@ -903,6 +980,14 @@ class RoutingDataset(Dataset):
     def _target_normalization_enabled(self) -> bool:
         return bool(self.config.section("targets").get("normalize", False))
 
+    def _target_scaling_method(self) -> str:
+        targets_cfg = self.config.section("targets")
+        return str(targets_cfg.get("scaling", targets_cfg.get("normalization", "standard"))).lower()
+
+    def _target_clip_normalized(self) -> bool:
+        targets_cfg = self.config.section("targets")
+        return bool(targets_cfg.get("clip_normalized", self._target_scaling_method() in {"percentile_minmax", "robust_minmax"}))
+
     def _transform_targets_array(self, array: np.ndarray, transform: str) -> np.ndarray:
         transform = str(transform or "identity").lower()
         if transform in {"", "none", "identity"}:
@@ -963,13 +1048,40 @@ class RoutingDataset(Dataset):
         if self.targets_np is None:
             raise RuntimeError("Targets must be loaded before computing target scaler.")
         transformed = self._transform_targets_array(self.targets_np, transform)
-        means = np.nanmean(transformed, axis=0).astype(self.dtype_np, copy=False)
-        stds = np.nanstd(transformed, axis=0).astype(self.dtype_np, copy=False)
-        means = np.where(np.isfinite(means), means, 0.0).astype(self.dtype_np, copy=False)
-        stds = np.where(np.isfinite(stds) & (stds > 1.0e-6), stds, 1.0).astype(self.dtype_np, copy=False)
+        scaling = self._target_scaling_method()
+        targets_cfg = self.config.section("targets")
+        if scaling in {"standard", "zscore", "z_score"}:
+            means = np.nanmean(transformed, axis=0).astype(self.dtype_np, copy=False)
+            stds = np.nanstd(transformed, axis=0).astype(self.dtype_np, copy=False)
+            means = np.where(np.isfinite(means), means, 0.0).astype(self.dtype_np, copy=False)
+            stds = np.where(np.isfinite(stds) & (stds > 1.0e-6), stds, 1.0).astype(self.dtype_np, copy=False)
+        elif scaling in {"percentile_minmax", "robust_minmax"}:
+            lower_percentile = float(targets_cfg.get("lower_percentile", 1.0))
+            upper_percentile = float(targets_cfg.get("upper_percentile", 99.0))
+            if not 0.0 <= lower_percentile < upper_percentile <= 100.0:
+                raise ValueError(
+                    "targets percentile_minmax scaling requires 0 <= lower_percentile < upper_percentile <= 100"
+                )
+            lower = np.nanpercentile(transformed, lower_percentile, axis=0).astype(self.dtype_np, copy=False)
+            upper = np.nanpercentile(transformed, upper_percentile, axis=0).astype(self.dtype_np, copy=False)
+            if "lower_bound" in targets_cfg:
+                lower = np.maximum(lower, float(targets_cfg["lower_bound"])).astype(self.dtype_np, copy=False)
+            if "upper_bound" in targets_cfg:
+                upper = np.minimum(upper, float(targets_cfg["upper_bound"])).astype(self.dtype_np, copy=False)
+            scale = upper - lower
+            means = np.where(np.isfinite(lower), lower, 0.0).astype(self.dtype_np, copy=False)
+            stds = np.where(np.isfinite(scale) & (scale > 1.0e-6), scale, 1.0).astype(self.dtype_np, copy=False)
+        else:
+            raise ValueError(
+                "targets.scaling must be one of: standard, zscore, percentile_minmax, robust_minmax"
+            )
 
         self.scaler.setdefault("target_stats", {})[group_name] = {
             "transform": transform,
+            "scaling": scaling,
+            "clip_normalized": self._target_clip_normalized(),
+            "lower_percentile": float(targets_cfg.get("lower_percentile", 1.0)),
+            "upper_percentile": float(targets_cfg.get("upper_percentile", 99.0)),
             "basin_ids": [str(value) for value in self.basin_ids],
             "variables": list(self.target_names),
             "means": {
@@ -990,14 +1102,36 @@ class RoutingDataset(Dataset):
         return means, stds
 
     def _normalize_targets_if_requested(self) -> None:
-        if not self._target_normalization_enabled():
-            self.target_scaler = None
-            return
         if self.targets_np is None:
             raise RuntimeError("Targets must be loaded before normalization.")
 
         group_name = self._target_scaler_group()
         requested_transform = self._target_transform_name()
+        if not self._target_normalization_enabled():
+            if requested_transform in {"", "none", "identity"}:
+                self.target_scaler = None
+                return
+            self.targets_np = self._transform_targets_array(self.targets_np, requested_transform).astype(
+                self.dtype_np,
+                copy=False,
+            )
+            means = np.zeros((len(self.basin_ids), len(self.target_names)), dtype=self.dtype_np)
+            stds = np.ones_like(means, dtype=self.dtype_np)
+            self.target_scaler = {
+                "group": group_name,
+                "transform": requested_transform,
+                "means": means,
+                "stds": stds,
+            }
+            logger.info(
+                "Targets transformed without normalization | group=%s | transform=%s | gauges=%s | variables=%s",
+                group_name,
+                requested_transform,
+                len(self.basin_ids),
+                ",".join(self.target_names),
+            )
+            return
+
         if self._target_stats_available(group_name):
             means, stds, transform = self._load_target_scaler(group_name)
         else:
@@ -1010,17 +1144,23 @@ class RoutingDataset(Dataset):
             means, stds = self._compute_target_scaler(group_name, transform)
 
         transformed = self._transform_targets_array(self.targets_np, transform)
-        self.targets_np = ((transformed - means[None, :, :]) / stds[None, :, :]).astype(self.dtype_np, copy=False)
+        normalized = (transformed - means[None, :, :]) / stds[None, :, :]
+        if self._target_clip_normalized():
+            normalized = np.clip(normalized, 0.0, 1.0)
+        self.targets_np = normalized.astype(self.dtype_np, copy=False)
         self.target_scaler = {
             "group": group_name,
             "transform": transform,
+            "scaling": self._target_scaling_method(),
+            "clip_normalized": self._target_clip_normalized(),
             "means": means,
             "stds": stds,
         }
         logger.info(
-            "Targets normalized | group=%s | transform=%s | gauges=%s | variables=%s",
+            "Targets normalized | group=%s | transform=%s | scaling=%s | gauges=%s | variables=%s",
             group_name,
             transform,
+            self._target_scaling_method(),
             len(self.basin_ids),
             ",".join(self.target_names),
         )
@@ -1250,15 +1390,26 @@ class RoutingDataset(Dataset):
             dtype=self.dtype_torch,
             grid_shape=self.x_info_global.get("grid_shape"),
         )
+        routing_model_cfg = self.config.section("routing_model")
+        self.routing_graph = preprocess_routing_graph_edge_features(
+            self.routing_graph,
+            edge_attr_key=str(routing_model_cfg.get("edge_attr_key", "edge_attr")),
+            include_names=routing_model_cfg.get("edge_attr_include_names"),
+            exclude_names=routing_model_cfg.get("edge_attr_exclude_names"),
+            drop_constant=bool(routing_model_cfg.get("drop_constant_edge_attr", False)),
+            normalize=bool(routing_model_cfg.get("normalize_edge_attr", False)),
+            constant_tol=float(routing_model_cfg.get("edge_attr_constant_tol", 1.0e-12)),
+        )
         if isinstance(self.routing_graph, dict):
             self.x_info_global["routing_graph_keys"] = list(self.routing_graph.keys())
             metadata = dict(self.routing_graph.get("metadata", {}) or {})
             self.x_info_global["routing_graph_metadata"] = metadata
             logger.info(
-                "Routing graph ready | nodes=%s | edges=%s | gauges=%s",
+                "Routing graph ready | nodes=%s | edges=%s | gauges=%s | edge_features=%s",
                 self.routing_graph.get("num_nodes", 0),
                 self.routing_graph.get("num_edges", 0),
                 self.routing_graph.get("num_gauges", 0),
+                self.routing_graph.get("edge_feature_names", []),
             )
         self._configure_routing_domain_compaction(graph_spec)
 
@@ -2493,8 +2644,83 @@ class RoutingDataset(Dataset):
                 f"sequence_days={self.window_sequence_days}, and stride_days={self.window_stride_days}"
             )
 
+    def _iter_split_segments(self) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+        if not self.split_blocks:
+            return []
+
+        merge_adjacent = bool(self.data_split_cfg.get("merge_adjacent_blocks", True))
+        gap_tolerance_days = int(self.data_split_cfg.get("merge_gap_days", 0) or 0)
+        blocks = sorted(self.split_blocks, key=lambda block: (block["start"], block["end"]))
+        segments: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        for block in blocks:
+            start = pd.Timestamp(block["start"])
+            end = pd.Timestamp(block["end"])
+            if not segments or not merge_adjacent:
+                segments.append((start, end))
+                continue
+
+            prev_start, prev_end = segments[-1]
+            allowed_next = prev_end + pd.DateOffset(days=gap_tolerance_days)
+            if start <= allowed_next:
+                segments[-1] = (prev_start, max(prev_end, end))
+            else:
+                segments.append((start, end))
+        return segments
+
+    def _build_precomputed_split_lookup(self, n_time: int) -> None:
+        if self.window_sequence_years is None and self.window_sequence_days is None:
+            if self.sequence_length <= 0:
+                raise RuntimeError("Precomputed block splits require sequence_length or windowing.sequence_days.")
+            sequence_steps = int(self.sequence_length)
+            stride_steps = int(self.stride or self.sequence_length)
+            self.lookup = []
+            for segment_start, segment_end in self._iter_split_segments():
+                start = int(self.time_index.searchsorted(segment_start, side="left"))
+                segment_stop = int(self.time_index.searchsorted(segment_end, side="left"))
+                while start + sequence_steps <= segment_stop:
+                    self._append_lookup_window(start, start + sequence_steps)
+                    start += stride_steps
+            if not self.lookup:
+                raise RuntimeError(f"No valid precomputed split windows created for period='{self.period}'.")
+            return
+
+        if self.window_sequence_years is not None:
+            sequence_offset = pd.DateOffset(years=int(self.window_sequence_years))
+            stride_offset = pd.DateOffset(years=int(self.window_stride_years or self.window_sequence_years))
+            stride_error_name = "windowing.stride_years"
+        else:
+            sequence_offset = pd.DateOffset(days=int(self.window_sequence_days))
+            stride_offset = pd.DateOffset(days=int(self.window_stride_days or self.window_sequence_days))
+            stride_error_name = "windowing.stride_days"
+
+        self.lookup = []
+        for segment_start, segment_end in self._iter_split_segments():
+            current_start = pd.Timestamp(segment_start)
+            segment_end = pd.Timestamp(segment_end)
+            while current_start < segment_end:
+                current_end_exclusive = current_start + sequence_offset
+                if current_end_exclusive > segment_end:
+                    break
+
+                forcing_start = int(self.time_index.searchsorted(current_start, side="left"))
+                forcing_end = int(self.time_index.searchsorted(current_end_exclusive, side="left"))
+                if forcing_end > forcing_start:
+                    self._append_lookup_window(forcing_start, forcing_end)
+
+                next_start = current_start + stride_offset
+                if next_start <= current_start:
+                    raise RuntimeError(f"Calendar window stride did not advance; check {stride_error_name}.")
+                current_start = next_start
+
+        if not self.lookup:
+            raise RuntimeError(f"No valid precomputed split windows created for period='{self.period}'.")
+
     def _build_lookup(self):
         n_time = len(self.time_index)
+
+        if self.split_blocks:
+            self._build_precomputed_split_lookup(n_time)
+            return
 
         if self.period in {"validation", "test"} and not (
             (self.window_sequence_years is not None or self.window_sequence_days is not None) and self.window_eval_periods

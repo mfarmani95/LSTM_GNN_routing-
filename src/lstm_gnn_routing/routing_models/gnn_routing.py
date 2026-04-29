@@ -195,6 +195,104 @@ def _apply_temporal_reduction(
     raise ValueError(f"Unsupported temporal_reduction '{temporal_reduction}'")
 
 
+class DirectedEdgeMessagePassingLayer(nn.Module):
+    """Directed edge-conditioned message passing over river-network edges."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        *,
+        edge_dim: int | None = None,
+        dropout: float = 0.0,
+        use_gate: bool = True,
+        aggregation: str = "sum",
+    ):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.edge_dim = 0 if edge_dim in {None, 0} else int(edge_dim)
+        self.dropout = float(dropout)
+        self.use_gate = bool(use_gate)
+        self.aggregation = str(aggregation or "sum").lower()
+        if self.aggregation not in {"sum", "mean"}:
+            raise ValueError("routing_model.edge_mp_aggregation must be one of: sum, mean")
+
+        message_in_dim = self.in_dim + self.edge_dim
+        self.message_mlp = nn.Sequential(
+            nn.Linear(message_in_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        if self.use_gate:
+            self.gate_mlp = nn.Sequential(
+                nn.Linear(message_in_dim, self.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim),
+                nn.Sigmoid(),
+            )
+        else:
+            self.gate_mlp = None
+        self.self_mlp = nn.Linear(self.in_dim, self.hidden_dim)
+        self.update_mlp = nn.Sequential(
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor | None = None,
+        edge_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        source, target = edge_index[0], edge_index[1]
+        source_state = x.index_select(0, source)
+        if self.edge_dim > 0:
+            if edge_attr is None:
+                edge_part = torch.zeros(
+                    source_state.shape[0],
+                    self.edge_dim,
+                    dtype=source_state.dtype,
+                    device=source_state.device,
+                )
+            else:
+                edge_part = edge_attr.to(dtype=source_state.dtype, device=source_state.device)
+                if int(edge_part.shape[-1]) != self.edge_dim:
+                    raise ValueError(
+                        f"Directed edge MPNN expected edge_dim={self.edge_dim}, "
+                        f"got edge_attr with shape {tuple(edge_part.shape)}"
+                    )
+            message_input = torch.cat([source_state, edge_part], dim=-1)
+        else:
+            message_input = source_state
+
+        messages = self.message_mlp(message_input)
+        if self.gate_mlp is not None:
+            messages = messages * self.gate_mlp(message_input)
+        if edge_weight is not None:
+            weights = edge_weight.to(dtype=messages.dtype, device=messages.device).reshape(-1, 1)
+            messages = messages * weights
+
+        aggregated = torch.zeros(
+            x.shape[0],
+            self.hidden_dim,
+            dtype=messages.dtype,
+            device=messages.device,
+        )
+        aggregated.index_add_(0, target, messages)
+        if self.aggregation == "mean":
+            counts = torch.zeros(x.shape[0], 1, dtype=messages.dtype, device=messages.device)
+            counts.index_add_(0, target, torch.ones(messages.shape[0], 1, dtype=messages.dtype, device=messages.device))
+            aggregated = aggregated / counts.clamp_min(1.0)
+
+        self_state = self.self_mlp(x)
+        return self.update_mlp(torch.cat([self_state, aggregated], dim=-1))
+
+
 class GraphRoutingModel(nn.Module):
     """
     Flexible GNN routing model for Routing grid runoff -> gauge/node streamflow.
@@ -237,6 +335,8 @@ class GraphRoutingModel(nn.Module):
         temporal_head_residual: bool = True,
         output_activation: str = "none",
         feature_clip: float | None = None,
+        edge_mp_use_gate: bool = True,
+        edge_mp_aggregation: str = "sum",
     ):
         super().__init__()
         if not HAS_TORCH_GEOMETRIC:
@@ -271,6 +371,8 @@ class GraphRoutingModel(nn.Module):
         self.temporal_head_residual = bool(temporal_head_residual)
         self.output_activation = str(output_activation).lower()
         self.feature_clip = None if feature_clip in {None, 0} else float(feature_clip)
+        self.edge_mp_use_gate = bool(edge_mp_use_gate)
+        self.edge_mp_aggregation = str(edge_mp_aggregation or "sum").lower()
 
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -362,6 +464,18 @@ class GraphRoutingModel(nn.Module):
         if self.conv_type == "GIN":
             mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
             return GINConv(mlp), hidden_dim
+        if self.conv_type in {"DIRECTED_EDGE_MPNN", "EDGE_MPNN", "DIRECTED_MPNN"}:
+            return (
+                DirectedEdgeMessagePassingLayer(
+                    in_dim,
+                    hidden_dim,
+                    edge_dim=self.edge_feature_dim,
+                    dropout=self.dropout,
+                    use_gate=self.edge_mp_use_gate,
+                    aggregation=self.edge_mp_aggregation,
+                ),
+                hidden_dim,
+            )
         raise ValueError(f"Unsupported routing conv_type '{self.conv_type}'")
 
     def _runoff_scaler_entry(self, key: str) -> Mapping[str, Any] | None:
@@ -433,6 +547,8 @@ class GraphRoutingModel(nn.Module):
             if edge_attr is not None:
                 return conv(x, edge_index, edge_attr=edge_attr)
             return conv(x, edge_index)
+        if self.conv_type in {"DIRECTED_EDGE_MPNN", "EDGE_MPNN", "DIRECTED_MPNN"}:
+            return conv(x, edge_index, edge_attr=edge_attr, edge_weight=edge_weight)
         return conv(x, edge_index)
 
     def _build_node_features(

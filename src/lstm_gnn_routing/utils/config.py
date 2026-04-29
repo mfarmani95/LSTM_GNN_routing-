@@ -86,6 +86,25 @@ class RoutingConfig:
         return value
 
     def _validate(self):
+        def _validate_positive_number(name: str, value: Any) -> None:
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be a positive number.") from exc
+            if numeric_value <= 0.0:
+                raise ValueError(f"{name} must be a positive number.")
+
+        def _validate_gauge_weight_mapping(name: str, mapping: Any) -> None:
+            if mapping is None:
+                return
+            if not isinstance(mapping, dict):
+                raise ValueError(f"{name} must be a YAML mapping of gauge_id: positive_weight.")
+            for gauge_id, weight in mapping.items():
+                gauge_text = str(gauge_id).strip()
+                if not gauge_text:
+                    raise ValueError(f"{name} contains an empty gauge identifier.")
+                _validate_positive_number(f"{name}[{gauge_text!r}]", weight)
+
         mandatory = [
             "data_dir",
             "train_basin_file",
@@ -211,11 +230,88 @@ class RoutingConfig:
         if routing_model_cfg.get("routing_lag_context_days") is not None:
             if int(routing_model_cfg.get("routing_lag_context_days")) < 0:
                 raise ValueError("routing_model.routing_lag_context_days must be non-negative when provided.")
+        training_cfg = self.section("training")
+        if training_cfg.get("weight_decay") is not None:
+            weight_decay = float(training_cfg.get("weight_decay"))
+            if weight_decay < 0.0:
+                raise ValueError("training.weight_decay must be non-negative.")
+        if training_cfg.get("mse_loss_weight") is not None:
+            if float(training_cfg.get("mse_loss_weight")) < 0.0:
+                raise ValueError("training.mse_loss_weight must be non-negative.")
+        if training_cfg.get("kge_loss_weight") is not None:
+            if float(training_cfg.get("kge_loss_weight")) < 0.0:
+                raise ValueError("training.kge_loss_weight must be non-negative.")
+        if training_cfg.get("peak_flow_weight") is not None:
+            if float(training_cfg.get("peak_flow_weight")) < 0.0:
+                raise ValueError("training.peak_flow_weight must be non-negative.")
+        if training_cfg.get("peak_flow_power") is not None:
+            if float(training_cfg.get("peak_flow_power")) <= 0.0:
+                raise ValueError("training.peak_flow_power must be positive.")
+        if training_cfg.get("peak_flow_max_weight") is not None:
+            if float(training_cfg.get("peak_flow_max_weight")) <= 0.0:
+                raise ValueError("training.peak_flow_max_weight must be positive.")
+        if training_cfg.get("jkge_benchmark") is not None:
+            benchmark = str(training_cfg.get("jkge_benchmark")).lower()
+            if benchmark not in {"moving_average", "section_mean"}:
+                raise ValueError(
+                    "training.jkge_benchmark must be one of: moving_average, section_mean"
+                )
+        if training_cfg.get("jkge_window") is not None:
+            if int(training_cfg.get("jkge_window")) <= 0:
+                raise ValueError("training.jkge_window must be positive.")
+        if training_cfg.get("jkge_section_length") is not None:
+            if int(training_cfg.get("jkge_section_length")) <= 0:
+                raise ValueError("training.jkge_section_length must be positive.")
+        if training_cfg.get("jkge_eps") is not None:
+            if float(training_cfg.get("jkge_eps")) <= 0.0:
+                raise ValueError("training.jkge_eps must be positive.")
+        if training_cfg.get("loss_target_space") is not None:
+            loss_target_space = str(training_cfg.get("loss_target_space")).lower()
+            if loss_target_space not in {"normalized", "physical", "original", "unscaled"}:
+                raise ValueError(
+                    "training.loss_target_space must be one of: normalized, physical, original, unscaled"
+                )
         curriculum_cfg = self.section("curriculum")
         if curriculum_cfg.get("early_stopping_scope") is not None:
             scope = str(curriculum_cfg.get("early_stopping_scope")).lower()
             if scope not in {"global", "stage"}:
                 raise ValueError("curriculum.early_stopping_scope must be one of: global, stage")
+        if curriculum_cfg.get("stage_learning_rate_decay") is not None:
+            _validate_positive_number(
+                "curriculum.stage_learning_rate_decay",
+                curriculum_cfg.get("stage_learning_rate_decay"),
+            )
+        if curriculum_cfg.get("outlet_gauge_weight") is not None:
+            _validate_positive_number(
+                "curriculum.outlet_gauge_weight",
+                curriculum_cfg.get("outlet_gauge_weight"),
+            )
+        _validate_gauge_weight_mapping(
+            "curriculum.gauge_weights",
+            curriculum_cfg.get("gauge_weights"),
+        )
+        stages_cfg = curriculum_cfg.get("stages")
+        if stages_cfg is not None and not isinstance(stages_cfg, list):
+            raise ValueError("curriculum.stages must be a YAML list when provided.")
+        for stage_index, stage in enumerate(stages_cfg or [], start=1):
+            if not isinstance(stage, dict):
+                raise ValueError(f"curriculum.stages[{stage_index}] must be a YAML mapping.")
+            if stage.get("epochs") is not None and int(stage.get("epochs")) <= 0:
+                raise ValueError(f"curriculum.stages[{stage_index}].epochs must be a positive integer.")
+            if stage.get("learning_rate") is not None:
+                _validate_positive_number(
+                    f"curriculum.stages[{stage_index}].learning_rate",
+                    stage.get("learning_rate"),
+                )
+            if stage.get("outlet_gauge_weight") is not None:
+                _validate_positive_number(
+                    f"curriculum.stages[{stage_index}].outlet_gauge_weight",
+                    stage.get("outlet_gauge_weight"),
+                )
+            _validate_gauge_weight_mapping(
+                f"curriculum.stages[{stage_index}].gauge_weights",
+                stage.get("gauge_weights"),
+            )
 
         transfer_cfg = self.section("runoff_transfer")
         if not transfer_cfg and isinstance(routing_cfg, dict):
@@ -224,6 +320,19 @@ class RoutingConfig:
             transfer_type = str(transfer_cfg.get("type", transfer_cfg.get("mode", "fixed"))).lower()
             if transfer_type not in {"fixed", "neural", "learned"}:
                 raise ValueError("runoff_transfer.type must be one of: fixed, neural, learned")
+            weight_strategy = str(transfer_cfg.get("weight_strategy", "stored")).lower()
+            if weight_strategy not in {
+                "stored",
+                "cell_area",
+                "inverse_distance",
+                "exp_distance",
+                "downhill",
+                "downhill_distance",
+            }:
+                raise ValueError(
+                    "runoff_transfer.weight_strategy must be one of: "
+                    "stored, cell_area, inverse_distance, exp_distance, downhill, downhill_distance"
+                )
             if int(transfer_cfg.get("hidden_dim", 16) or 16) <= 0:
                 raise ValueError("runoff_transfer.hidden_dim must be positive when provided")
 
