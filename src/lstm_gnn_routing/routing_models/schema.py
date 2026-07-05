@@ -69,7 +69,8 @@ def _flatten_index_from_grid(
 ) -> torch.Tensor:
     if grid_shape is None:
         raise ValueError("grid_shape is required to build flat_index from node_y/node_x")
-    y_size, x_size = int(grid_shape[0]), int(grid_shape[1])
+    # y_size, x_size = int(grid_shape[0]), int(grid_shape[1])
+    x_size = int(grid_shape[1])
     return node_y * x_size + node_x
 
 

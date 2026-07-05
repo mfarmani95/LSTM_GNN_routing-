@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import subprocess
 import sys
 from collections import defaultdict, deque
@@ -835,12 +834,12 @@ def _ensure_gnn_evaluation(args: argparse.Namespace, default_output_dir: Path) -
         raise ValueError("Provide either --evaluation-dir or --run-dir.")
 
     eval_dir = args.gnn_evaluation_output_dir or (args.run_dir / "evaluation_full_period_best_final_stage_model")
-    marker_files = [
-        eval_dir / "predictions.csv",
-        eval_dir / "streamflow_timeseries.csv",
-        eval_dir / "evaluation_timeseries.csv",
-        eval_dir / "metrics_summary.csv",
-    ]
+    # marker_files = [
+    #     eval_dir / "predictions.csv",
+    #     eval_dir / "streamflow_timeseries.csv",
+    #     eval_dir / "evaluation_timeseries.csv",
+    #     eval_dir / "metrics_summary.csv",
+    # ]
     has_existing_csv = eval_dir.exists() and any(eval_dir.rglob("*.csv"))
     if has_existing_csv and not args.force_evaluate:
         print(f"Using existing GNN evaluation directory: {eval_dir}")

@@ -1,26 +1,35 @@
+# Python cache/build files
 __pycache__/
 *.py[cod]
-.DS_Store
-.env
-.venv/
 *.egg-info/
 build/
 dist/
-runs/
-scalers/*.yml
-scalers/*.yaml
+.pytest_cache/
+.ruff_cache/
+
+# OS/editor files
+.DS_Store
+.env
+.venv/
+.vscode/
+.idea/
+
+# Data and generated outputs
 data/
+runs/
+paper_analysis/
+scalers/
+configs/
+
+# Analysis output folders
+analysis_sample_rapid_bounds_test/
+analysis_sample_rapid_diff_map_test/
+
+# Model/checkpoint files
 *.pt
 *.pth
 *.ckpt
 
-runs/
-analysis_sample_rapid_bounds_test/
-analysis_sample_rapid_diff_map_test/
+# Config files generated from experiments
 *.yml
 *.yaml
-runs/
-cinfigs/
-paper_analysis/
-scalers/
-configs/

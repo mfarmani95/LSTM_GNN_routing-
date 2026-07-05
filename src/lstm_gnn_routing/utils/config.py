@@ -551,10 +551,6 @@ class RoutingConfig:
         return str(self.execution.get("mode", "unified")).lower()
 
     @property
-    def execution_routing_device(self) -> str:
-        return str(self.execution.get("routing_device", self.device))
-
-    @property
     def execution_parameter_model_device(self) -> str:
         return str(self.execution.get("parameter_model_device", self.device))
 
