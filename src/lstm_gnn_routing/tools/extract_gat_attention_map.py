@@ -13,7 +13,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping
+from typing import Any, Dict, Mapping
 
 import matplotlib.pyplot as plt
 import numpy as np

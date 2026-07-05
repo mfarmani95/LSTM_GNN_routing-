@@ -4,7 +4,7 @@ import argparse
 import inspect
 import shutil
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import xarray as xr
 
