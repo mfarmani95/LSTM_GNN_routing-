@@ -27,14 +27,49 @@ preprocess = [
   "zarr",
 ]
 
+database = [
+  "duckdb",
+  "pyarrow",
+]
+
+dashboard = [
+  "streamlit",
+  "plotly",
+  "duckdb",
+  "pyarrow",
+]
+
+dev = [
+  "pytest",
+  "ruff",
+]
+
+all = [
+  "lstm-gnn-routing[preprocess,database,dashboard,dev]",
+]
+
 [project.scripts]
 lstm-gnn-routing = "lstm_gnn_routing.cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-    "ruff>=0.15.20",
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [
+  ".git",
+  ".venv",
+  "data",
+  "runs",
+  "configs",
+  "scalers",
+  "paper_analysis",
+  "notebooks",
 ]
+
+[tool.ruff.lint]
+select = ["F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
