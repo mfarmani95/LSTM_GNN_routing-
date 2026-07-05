@@ -20,3 +20,7 @@ analysis_sample_rapid_diff_map_test/
 *.yml
 *.yaml
 runs/
+cinfigs/
+paper_analysis/
+scalers/
+configs/

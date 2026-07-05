@@ -7,11 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from torch_geometric.nn import GATConv, GCNConv, GINConv, SAGEConv
+    from torch_geometric.nn import GATConv, GCNConv, GINConv, GINEConv, SAGEConv
 
     HAS_TORCH_GEOMETRIC = True
 except ImportError:  # pragma: no cover - optional dependency
-    GATConv = GCNConv = GINConv = SAGEConv = None
+    GATConv = GCNConv = GINConv = GINEConv = SAGEConv = None
     HAS_TORCH_GEOMETRIC = False
 
 
@@ -293,6 +293,38 @@ class DirectedEdgeMessagePassingLayer(nn.Module):
         return self.update_mlp(torch.cat([self_state, aggregated], dim=-1))
 
 
+class _SAGEConvWrapper(nn.Module):
+    """GraphSAGE wrapper with the same call shape as the other routing convs."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = SAGEConv(in_channels, out_channels)
+
+    def forward(self, x, edge_index, edge_weight=None, edge_attr=None):
+        return self.conv(x, edge_index)
+
+
+class _GINEConvWrapper(nn.Module):
+    """Edge-aware GINE layer with a routing-friendly forward signature."""
+
+    def __init__(self, in_channels: int, out_channels: int, edge_dim: int | None):
+        super().__init__()
+        if edge_dim is None or edge_dim <= 0:
+            raise ValueError("GINEConv requires edge attributes; set routing_model.edge_attr_key.")
+        mlp = nn.Sequential(
+            nn.Linear(in_channels, out_channels),
+            nn.ReLU(),
+            nn.Linear(out_channels, out_channels),
+        )
+        self.edge_dim = int(edge_dim)
+        self.conv = GINEConv(mlp, edge_dim=self.edge_dim)
+
+    def forward(self, x, edge_index, edge_weight=None, edge_attr=None):
+        if edge_attr is None:
+            edge_attr = x.new_zeros((edge_index.size(1), self.edge_dim))
+        return self.conv(x, edge_index, edge_attr)
+
+
 class GraphRoutingModel(nn.Module):
     """
     Flexible GNN routing model for Routing grid runoff -> gauge/node streamflow.
@@ -334,6 +366,7 @@ class GraphRoutingModel(nn.Module):
         temporal_head_hidden_dim: int | None = None,
         temporal_head_residual: bool = True,
         output_activation: str = "none",
+        final_output_clamp_min: float | None = None,
         feature_clip: float | None = None,
         edge_mp_use_gate: bool = True,
         edge_mp_aggregation: str = "sum",
@@ -370,6 +403,9 @@ class GraphRoutingModel(nn.Module):
         self.temporal_head_type = str(temporal_head or "none").lower()
         self.temporal_head_residual = bool(temporal_head_residual)
         self.output_activation = str(output_activation).lower()
+        self.final_output_clamp_min = (
+            None if final_output_clamp_min in {None, ""} else float(final_output_clamp_min)
+        )
         self.feature_clip = None if feature_clip in {None, 0} else float(feature_clip)
         self.edge_mp_use_gate = bool(edge_mp_use_gate)
         self.edge_mp_aggregation = str(edge_mp_aggregation or "sum").lower()
@@ -447,7 +483,7 @@ class GraphRoutingModel(nn.Module):
     def _make_conv(self, in_dim: int, hidden_dim: int):
         if self.conv_type == "GCN":
             return GCNConv(in_dim, hidden_dim), hidden_dim
-        if self.conv_type == "SAGE":
+        if self.conv_type in {"SAGE", "GRAPHSAGE", "SAGECONV"}:
             return SAGEConv(in_dim, hidden_dim), hidden_dim
         if self.conv_type == "GAT":
             if hidden_dim % self.gat_heads != 0:
@@ -464,6 +500,8 @@ class GraphRoutingModel(nn.Module):
         if self.conv_type == "GIN":
             mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim))
             return GINConv(mlp), hidden_dim
+        if self.conv_type in {"GINE", "GINECONV"}:
+            return _GINEConvWrapper(in_dim, hidden_dim, self.edge_feature_dim), hidden_dim
         if self.conv_type in {"DIRECTED_EDGE_MPNN", "EDGE_MPNN", "DIRECTED_MPNN"}:
             return (
                 DirectedEdgeMessagePassingLayer(
@@ -547,6 +585,8 @@ class GraphRoutingModel(nn.Module):
             if edge_attr is not None:
                 return conv(x, edge_index, edge_attr=edge_attr)
             return conv(x, edge_index)
+        if self.conv_type in {"GINE", "GINECONV"}:
+            return conv(x, edge_index, edge_attr=edge_attr)
         if self.conv_type in {"DIRECTED_EDGE_MPNN", "EDGE_MPNN", "DIRECTED_MPNN"}:
             return conv(x, edge_index, edge_attr=edge_attr, edge_weight=edge_weight)
         return conv(x, edge_index)
@@ -699,6 +739,8 @@ class GraphRoutingModel(nn.Module):
 
         prediction = torch.cat(routed_chunks, dim=1)
         prediction = self._apply_temporal_head(prediction)
+        if self.final_output_clamp_min is not None:
+            prediction = torch.clamp(prediction, min=self.final_output_clamp_min)
         if prediction.shape[-1] == 1:
             prediction = prediction.squeeze(-1)
         return _apply_temporal_reduction(

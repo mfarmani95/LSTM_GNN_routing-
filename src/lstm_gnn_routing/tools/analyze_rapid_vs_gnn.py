@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from lstm_gnn_routing.tools.rapid_file import detect_rapid_file
+
 
 DEFAULT_STATIONS = ["09508500", "09499000", "09498500"]
 DEFAULT_COMIDS = [20438416, 22431630, 22442058]
@@ -42,7 +44,7 @@ DEFAULT_EVALUATION_DIR = Path(
     "runs/After_transfer_scaling_center_mapping_derived_hydrology_stage5_dam_filtered/"
     "evaluation_test_best_final_stage_model"
 )
-DEFAULT_RAPID_FILE = Path("/xdisk/tyferre/farmani/Graph_Routing/RAPID_13nd.nc")
+DEFAULT_RAPID_FILE = None
 KGESS_BENCHMARK = 1.0 - math.sqrt(2.0)
 
 
@@ -216,7 +218,20 @@ def _read_gnn_timeseries(evaluation_dir: Path, period: str, stations: list[str])
     if not path.is_file():
         raise FileNotFoundError(f"Missing GNN evaluation timeseries: {path}")
     station_set = {str(value) for value in stations}
-    ts = pd.read_csv(path, dtype={"gauge_id": str}, parse_dates=["date"])
+    try:
+        ts = pd.read_csv(path, dtype={"gauge_id": str}, parse_dates=["date"])
+    except pd.errors.ParserError as exc:
+        print(
+            f"WARNING: Failed to parse {path} with the default CSV engine ({exc}). "
+            "Retrying with engine='python' and on_bad_lines='skip'."
+        )
+        ts = pd.read_csv(
+            path,
+            dtype={"gauge_id": str},
+            parse_dates=["date"],
+            engine="python",
+            on_bad_lines="skip",
+        )
     ts = ts[ts["gauge_id"].isin(station_set)].copy()
     if ts.empty:
         raise ValueError(f"No requested stations were found in {path}")
@@ -858,45 +873,76 @@ def _write_tables(
     (output_dir / "rapid_gnn_summary.json").write_text(json.dumps(summary, indent=2, default=str))
 
 
+def _gauge_plot_dir(output_dir: Path, gauge_id: str) -> Path:
+    gauge_dir = output_dir / "by_gauge" / str(gauge_id)
+    gauge_dir.mkdir(parents=True, exist_ok=True)
+    return gauge_dir
+
+
 def _plot_daily_timeseries(plt, data: pd.DataFrame, output_dir: Path, dpi: int) -> None:
-    gauges = list(data["gauge_id"].drop_duplicates())
-    fig, axes = plt.subplots(len(gauges), 1, figsize=(15, 4.2 * len(gauges)), sharex=True)
-    if len(gauges) == 1:
-        axes = [axes]
-    for ax, gauge_id in zip(axes, gauges):
-        subset = data[data["gauge_id"] == gauge_id]
-        ax.plot(subset["date"], subset["observed"], color="#1f4e79", linewidth=1.3, label="Observed")
-        ax.plot(subset["date"], subset["gnn"], color="#c44900", linewidth=1.0, alpha=0.85, label="GNN")
-        ax.plot(subset["date"], subset["rapid"], color="#2a9d8f", linewidth=1.0, alpha=0.85, label="RAPID")
+    for gauge_id, subset in data.groupby("gauge_id", sort=True):
+        gauge_dir = _gauge_plot_dir(output_dir, str(gauge_id))
+        fig, ax = plt.subplots(figsize=(15, 5.0))
+        ax.plot(subset["date"], subset["observed"], color="#1f4e79", linewidth=1.4, label="Observed")
+        ax.plot(subset["date"], subset["rapid"], color="#2a9d8f", linewidth=1.1, alpha=0.82, label="RAPID")
+        ax.plot(subset["date"], subset["gnn"], color="#c44900", linewidth=1.1, alpha=0.82, label="GNN")
         ax.set_title(f"{gauge_id} daily streamflow")
+        ax.set_xlabel("Date")
         ax.set_ylabel("Streamflow (m3/s)")
         ax.grid(True, alpha=0.25)
         ax.legend(frameon=False, ncol=3)
-    axes[-1].set_xlabel("Date")
-    fig.tight_layout()
-    fig.savefig(output_dir / "daily_timeseries_rapid_gnn_observed.png", dpi=dpi)
-    plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(gauge_dir / "daily_timeseries_rapid_gnn_observed.png", dpi=dpi)
+        plt.close(fig)
 
 
 def _plot_monthly_timeseries(plt, monthly: pd.DataFrame, output_dir: Path, dpi: int, aggregation: str) -> None:
-    gauges = list(monthly["gauge_id"].drop_duplicates())
     ylabel = "Monthly sum of daily streamflow (m3/s)" if aggregation == "sum" else "Monthly mean streamflow (m3/s)"
-    fig, axes = plt.subplots(len(gauges), 1, figsize=(15, 4.2 * len(gauges)), sharex=True)
-    if len(gauges) == 1:
-        axes = [axes]
-    for ax, gauge_id in zip(axes, gauges):
-        subset = monthly[monthly["gauge_id"] == gauge_id]
-        ax.plot(subset["month_start"], subset["observed"], color="#1f4e79", marker="o", markersize=2.5, label="Observed")
-        ax.plot(subset["month_start"], subset["gnn"], color="#c44900", marker="o", markersize=2.5, label="GNN")
-        ax.plot(subset["month_start"], subset["rapid"], color="#2a9d8f", marker="o", markersize=2.5, label="RAPID")
+    for gauge_id, subset in monthly.groupby("gauge_id", sort=True):
+        gauge_dir = _gauge_plot_dir(output_dir, str(gauge_id))
+        fig, ax = plt.subplots(figsize=(15, 5.0))
+        ax.plot(subset["month_start"], subset["observed"], color="#1f4e79", marker="o", markersize=2.6, label="Observed")
+        ax.plot(subset["month_start"], subset["rapid"], color="#2a9d8f", marker="o", markersize=2.6, alpha=0.82, label="RAPID")
+        ax.plot(subset["month_start"], subset["gnn"], color="#c44900", marker="o", markersize=2.6, alpha=0.82, label="GNN")
         ax.set_title(f"{gauge_id} monthly {aggregation}")
+        ax.set_xlabel("Month")
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.25)
         ax.legend(frameon=False, ncol=3)
-    axes[-1].set_xlabel("Month")
-    fig.tight_layout()
-    fig.savefig(output_dir / f"monthly_{aggregation}_timeseries_rapid_gnn_observed.png", dpi=dpi)
-    plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(gauge_dir / f"monthly_{aggregation}_timeseries_rapid_gnn_observed.png", dpi=dpi)
+        plt.close(fig)
+
+
+def _plot_flow_duration_curves(plt, data: pd.DataFrame, output_dir: Path, dpi: int) -> None:
+    colors = {"observed": "#1f4e79", "rapid": "#2a9d8f", "gnn": "#c44900"}
+    labels = {"observed": "Observed", "rapid": "RAPID", "gnn": "GNN"}
+    for gauge_id, subset in data.groupby("gauge_id", sort=True):
+        gauge_dir = _gauge_plot_dir(output_dir, str(gauge_id))
+        fig, ax = plt.subplots(figsize=(8.5, 6.0))
+        has_positive = False
+        for source in ["observed", "rapid", "gnn"]:
+            values = subset[source].to_numpy(dtype=float)
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                continue
+            sorted_values = np.sort(values)[::-1]
+            exceedance = 100.0 * (np.arange(1, sorted_values.size + 1) / (sorted_values.size + 1))
+            has_positive = has_positive or bool(np.nanmax(sorted_values) > 0.0)
+            ax.plot(exceedance, sorted_values, color=colors[source], linewidth=1.7, alpha=0.86, label=labels[source])
+        ax.set_title(f"{gauge_id} flow duration curve")
+        ax.set_xlabel("Exceedance probability (%)")
+        ax.set_ylabel("Daily streamflow (m3/s)")
+        ax.set_xlim(0.0, 100.0)
+        if has_positive:
+            ymin, ymax = ax.get_ylim()
+            if ymin > 0.0 and ymax > ymin:
+                ax.set_yscale("log")
+        ax.grid(True, which="both", alpha=0.25)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(gauge_dir / "daily_flow_duration_curve_rapid_gnn_observed.png", dpi=dpi)
+        plt.close(fig)
 
 
 def _plot_season_boxplots(plt, monthly: pd.DataFrame, output_dir: Path, dpi: int, aggregation: str) -> None:
@@ -910,12 +956,9 @@ def _plot_season_boxplots(plt, monthly: pd.DataFrame, output_dir: Path, dpi: int
     source_order = ["observed", "gnn", "rapid"]
     colors = {"observed": "#1f4e79", "gnn": "#c44900", "rapid": "#2a9d8f"}
     ylabel = "Monthly sum of daily streamflow (m3/s)" if aggregation == "sum" else "Monthly mean streamflow (m3/s)"
-    gauges = list(long["gauge_id"].drop_duplicates())
-    fig, axes = plt.subplots(len(gauges), 1, figsize=(10.5, 4.0 * len(gauges)), sharey=False)
-    if len(gauges) == 1:
-        axes = [axes]
-    for ax, gauge_id in zip(axes, gauges):
-        subset = long[long["gauge_id"] == gauge_id]
+    for gauge_id, subset in long.groupby("gauge_id", sort=True):
+        gauge_dir = _gauge_plot_dir(output_dir, str(gauge_id))
+        fig, ax = plt.subplots(figsize=(10.5, 4.6))
         positions = []
         labels = []
         data = []
@@ -937,60 +980,66 @@ def _plot_season_boxplots(plt, monthly: pd.DataFrame, output_dir: Path, dpi: int
         ax.set_xticks(positions)
         ax.set_xticklabels(labels)
         ax.grid(True, axis="y", alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(output_dir / f"seasonal_dec_may_jun_sep_monthly_{aggregation}_boxplots.png", dpi=dpi)
-    plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(gauge_dir / f"seasonal_dec_may_jun_sep_monthly_{aggregation}_boxplots.png", dpi=dpi)
+        plt.close(fig)
 
 
 def _plot_metric_bars(plt, metrics: pd.DataFrame, output_dir: Path, dpi: int) -> None:
     daily = metrics[metrics["scale"] == "daily"].copy()
     if daily.empty:
         return
-    gauges = list(daily["gauge_id"].drop_duplicates())
     metric_names = ["kgess", "kge", "nse", "rmse", "pbias"]
-    fig, axes = plt.subplots(len(metric_names), 1, figsize=(11.5, 3.1 * len(metric_names)), sharex=True)
-    x = np.arange(len(gauges))
-    width = 0.36
-    for ax, metric in zip(axes, metric_names):
-        gnn_values = []
-        rapid_values = []
-        for gauge_id in gauges:
-            gauge_rows = daily[daily["gauge_id"] == gauge_id]
-            gnn_values.append(_safe_float(gauge_rows[gauge_rows["model"] == "GNN"][metric].iloc[0]))
-            rapid_values.append(_safe_float(gauge_rows[gauge_rows["model"] == "RAPID"][metric].iloc[0]))
-        ax.bar(x - width / 2, gnn_values, width, label="GNN", color="#c44900", alpha=0.85)
-        ax.bar(x + width / 2, rapid_values, width, label="RAPID", color="#2a9d8f", alpha=0.85)
-        ax.set_ylabel(metric.upper())
+    for gauge_id, gauge_rows in daily.groupby("gauge_id", sort=True):
+        gauge_dir = _gauge_plot_dir(output_dir, str(gauge_id))
+        fig, ax = plt.subplots(figsize=(9.0, 5.0))
+        x = np.arange(len(metric_names))
+        width = 0.36
+        gnn_values = [
+            _safe_float(gauge_rows[gauge_rows["model"] == "GNN"][metric].iloc[0])
+            if not gauge_rows[gauge_rows["model"] == "GNN"].empty
+            else np.nan
+            for metric in metric_names
+        ]
+        rapid_values = [
+            _safe_float(gauge_rows[gauge_rows["model"] == "RAPID"][metric].iloc[0])
+            if not gauge_rows[gauge_rows["model"] == "RAPID"].empty
+            else np.nan
+            for metric in metric_names
+        ]
+        ax.bar(x - width / 2, rapid_values, width, label="RAPID", color="#2a9d8f", alpha=0.85)
+        ax.bar(x + width / 2, gnn_values, width, label="GNN", color="#c44900", alpha=0.85)
+        ax.set_title(f"{gauge_id} daily metrics")
+        ax.set_xticks(x)
+        ax.set_xticklabels([metric.upper() for metric in metric_names])
+        ax.set_ylabel("Metric value")
         ax.grid(True, axis="y", alpha=0.25)
-        if metric in {"kgess", "kge", "nse"}:
-            ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.axhline(0.0, color="black", linewidth=0.8)
         ax.legend(frameon=False, ncol=2)
-    axes[-1].set_xticks(x)
-    axes[-1].set_xticklabels(gauges)
-    fig.tight_layout()
-    fig.savefig(output_dir / "daily_metric_bars_rapid_vs_gnn.png", dpi=dpi)
-    plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(gauge_dir / "daily_metric_bars_rapid_vs_gnn.png", dpi=dpi)
+        plt.close(fig)
 
 
 def _plot_scatter(plt, data: pd.DataFrame, output_dir: Path, dpi: int) -> None:
-    gauges = list(data["gauge_id"].drop_duplicates())
-    fig, axes = plt.subplots(1, len(gauges), figsize=(5.0 * len(gauges), 4.7), sharex=False, sharey=False)
-    if len(gauges) == 1:
-        axes = [axes]
-    for ax, gauge_id in zip(axes, gauges):
-        subset = data[data["gauge_id"] == gauge_id]
+    for gauge_id, subset in data.groupby("gauge_id", sort=True):
+        gauge_dir = _gauge_plot_dir(output_dir, str(gauge_id))
+        fig, ax = plt.subplots(figsize=(6.5, 6.0))
         max_value = float(subset[["observed", "gnn", "rapid"]].max().max())
-        ax.scatter(subset["observed"], subset["gnn"], s=10, alpha=0.35, label="GNN", color="#c44900")
-        ax.scatter(subset["observed"], subset["rapid"], s=10, alpha=0.35, label="RAPID", color="#2a9d8f")
+        max_value = max(max_value, 0.0)
+        ax.scatter(subset["observed"], subset["rapid"], s=13, alpha=0.28, label="RAPID", color="#2a9d8f")
+        ax.scatter(subset["observed"], subset["gnn"], s=13, alpha=0.28, label="GNN", color="#c44900")
         ax.plot([0, max_value], [0, max_value], color="black", linewidth=0.9)
-        ax.set_title(gauge_id)
+        ax.set_title(f"{gauge_id} daily scatter")
         ax.set_xlabel("Observed (m3/s)")
         ax.set_ylabel("Simulation (m3/s)")
+        ax.set_xlim(left=0.0)
+        ax.set_ylim(bottom=0.0)
         ax.grid(True, alpha=0.25)
         ax.legend(frameon=False)
-    fig.tight_layout()
-    fig.savefig(output_dir / "daily_scatter_rapid_gnn_vs_observed.png", dpi=dpi)
-    plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(gauge_dir / "daily_scatter_rapid_gnn_vs_observed.png", dpi=dpi)
+        plt.close(fig)
 
 
 def _plot_spatial_metric_comparison(
@@ -1034,7 +1083,7 @@ def _plot_spatial_metric_comparison(
             group[x_col],
             group[y_col],
             c=values,
-            cmap="YlGnBu",
+            cmap="jet",
             vmin=0.0,
             vmax=1.0,
             s=70,
@@ -1085,7 +1134,7 @@ def _plot_spatial_kgess_difference(
     if plot_data.empty:
         return
 
-    value_limit = 0.5
+    value_limit = 1.0
     target_crs = _resolve_plot_crs(coord_cols, map_dem, gauge_crs)
     plot_background = _prepare_background_shape(background_shape, target_crs)
     background_bounds = _background_bounds(plot_background)
@@ -1137,6 +1186,7 @@ def _write_plots(
     plt = _require_matplotlib()
     _plot_daily_timeseries(plt, aligned_daily, plot_dir, dpi)
     _plot_monthly_timeseries(plt, monthly, plot_dir, dpi, aggregation)
+    _plot_flow_duration_curves(plt, aligned_daily, plot_dir, dpi)
     _plot_season_boxplots(plt, monthly, plot_dir, dpi, aggregation)
     _plot_metric_bars(plt, metrics, plot_dir, dpi)
     _plot_scatter(plt, aligned_daily, plot_dir, dpi)
@@ -1171,6 +1221,8 @@ def _write_plots(
 
 def main() -> None:
     args = _parse_args()
+    args.rapid_file = detect_rapid_file(args.rapid_file, qout_var=args.qout_var)
+    print(f"Using RAPID file: {args.rapid_file}")
     if args.stations_from_evaluation:
         stations = _read_evaluation_stations(args.evaluation_dir, args.period)
     elif len(args.stations) == 1 and str(args.stations[0]).lower() in {"dam_filtered", "dam-filtered", "trained"}:

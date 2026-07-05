@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 import torch
+from lstm_gnn_routing.training.jkge_sa_v2_loss import jkge_ma_v1_loss, jkge_sa_v1_loss, jkge_sa_v2_loss
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
@@ -487,6 +488,130 @@ class JKGELoss(BaseLoss):
         )
 
 
+class JKGESAV2Loss(BaseLoss):
+    """Section-anomaly JKGE v2 loss with component averaging across gauges."""
+
+    def __init__(self, config: Any | None = None):
+        super().__init__(config)
+        training_cfg = config.section("training") if config is not None and hasattr(config, "section") else {}
+        self.section_length = int(training_cfg.get("jkge_sa_v2_section_length", 30))
+        self.eps = float(training_cfg.get("jkge_sa_v2_eps", 1.0e-8))
+        self.min_valid_sections = int(training_cfg.get("jkge_sa_v2_min_valid_sections", 1))
+        benchmark = str(training_cfg.get("jkge_sa_v2_benchmark", "non_overlapping_sections")).lower()
+        if benchmark not in {"non_overlapping_sections", "sections", "section_mean"}:
+            raise ValueError(
+                "training.jkge_sa_v2_benchmark must be non_overlapping_sections "
+                "(fixed non-overlapping sections)."
+            )
+        if self.section_length <= 0 and self.section_length != 999:
+            raise ValueError("training.jkge_sa_v2_section_length must be positive or 999.")
+        if self.eps <= 0.0:
+            raise ValueError("training.jkge_sa_v2_eps must be positive.")
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        preds = _reshape_series_first(predictions)
+        obs = _reshape_series_first(targets)
+        preds, obs = self._maybe_inverse_transform_targets(preds, obs)
+        valid = _combine_valid_mask(preds, obs, mask=mask)
+        valid_counts = valid.sum(dim=1)
+        series_weights = _series_weights(weights, obs, valid, valid_counts)
+        return jkge_sa_v2_loss(
+            preds,
+            obs,
+            mask=valid,
+            weights=series_weights,
+            section_length=self.section_length,
+            eps=self.eps,
+            min_valid_sections=self.min_valid_sections,
+        )
+
+
+class JKGESAV1Loss(BaseLoss):
+    """Section-anomaly JKGE v1 loss with non-overlapping sections."""
+
+    def __init__(self, config: Any | None = None):
+        super().__init__(config)
+        training_cfg = config.section("training") if config is not None and hasattr(config, "section") else {}
+        self.section_length = int(training_cfg.get("jkge_sa_v1_section_length", 30))
+        self.eps = float(training_cfg.get("jkge_sa_v1_eps", 1.0e-8))
+        self.min_valid_sections = int(training_cfg.get("jkge_sa_v1_min_valid_sections", 1))
+        benchmark = str(training_cfg.get("jkge_sa_v1_benchmark", "non_overlapping_sections")).lower()
+        if benchmark not in {"non_overlapping_sections", "sections", "section_mean"}:
+            raise ValueError(
+                "training.jkge_sa_v1_benchmark must be non_overlapping_sections "
+                "(fixed non-overlapping sections)."
+            )
+        if self.section_length <= 0 and self.section_length != 999:
+            raise ValueError("training.jkge_sa_v1_section_length must be positive or 999.")
+        if self.eps <= 0.0:
+            raise ValueError("training.jkge_sa_v1_eps must be positive.")
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        preds = _reshape_series_first(predictions)
+        obs = _reshape_series_first(targets)
+        preds, obs = self._maybe_inverse_transform_targets(preds, obs)
+        valid = _combine_valid_mask(preds, obs, mask=mask)
+        valid_counts = valid.sum(dim=1)
+        series_weights = _series_weights(weights, obs, valid, valid_counts)
+        return jkge_sa_v1_loss(
+            preds,
+            obs,
+            mask=valid,
+            weights=series_weights,
+            section_length=self.section_length,
+            eps=self.eps,
+            min_valid_sections=self.min_valid_sections,
+        )
+
+
+class JKGEMAV1Loss(BaseLoss):
+    """Moving-average JKGE v1 loss with component averaging across gauges."""
+
+    def __init__(self, config: Any | None = None):
+        super().__init__(config)
+        training_cfg = config.section("training") if config is not None and hasattr(config, "section") else {}
+        self.window_length = int(training_cfg.get("jkge_ma_v1_window_length", training_cfg.get("jkge_window", 31)))
+        self.eps = float(training_cfg.get("jkge_ma_v1_eps", 1.0e-8))
+        if self.window_length <= 0:
+            raise ValueError("training.jkge_ma_v1_window_length must be positive.")
+        if self.eps <= 0.0:
+            raise ValueError("training.jkge_ma_v1_eps must be positive.")
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        preds = _reshape_series_first(predictions)
+        obs = _reshape_series_first(targets)
+        preds, obs = self._maybe_inverse_transform_targets(preds, obs)
+        valid = _combine_valid_mask(preds, obs, mask=mask)
+        valid_counts = valid.sum(dim=1)
+        series_weights = _series_weights(weights, obs, valid, valid_counts)
+        return jkge_ma_v1_loss(
+            preds,
+            obs,
+            mask=valid,
+            weights=series_weights,
+            window_length=self.window_length,
+            eps=self.eps,
+        )
+
+
 class MixedMSEKGELoss(BaseLoss):
     """Blend stable pointwise MSE with a small KGE-shaped hydrologic objective."""
 
@@ -550,6 +675,12 @@ def get_loss_function(config: Any | None = None) -> BaseLoss:
         return KGEAveragedComponentsLoss(config)
     if loss_name in {"jkge", "jawad_kge", "jawad_kling_gupta", "jawad_kling_gupta_efficiency"}:
         return JKGELoss(config)
+    if loss_name in {"jkge_sa_v2", "jkge_section_anomaly_v2", "jawad_kge_sa_v2"}:
+        return JKGESAV2Loss(config)
+    if loss_name in {"jkge_sa_v1", "jkge_section_anomaly_v1", "jawad_kge_sa_v1"}:
+        return JKGESAV1Loss(config)
+    if loss_name in {"jkge_ma_v1", "jkge_moving_average_v1", "jawad_kge_ma_v1"}:
+        return JKGEMAV1Loss(config)
     if loss_name in {"mixed_mse_kge", "mse_kge", "masked_mse_kge"}:
         return MixedMSEKGELoss(config)
 

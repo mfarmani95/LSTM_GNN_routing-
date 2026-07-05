@@ -245,6 +245,7 @@ def build_routing_model(config, *, example_batch: Mapping[str, Any], device=None
         temporal_head_hidden_dim=routing_cfg.get("temporal_head_hidden_dim"),
         temporal_head_residual=bool(routing_cfg.get("temporal_head_residual", True)),
         output_activation=str(routing_cfg.get("output_activation", "none")),
+        final_output_clamp_min=routing_cfg.get("final_output_clamp_min"),
         feature_clip=routing_cfg.get("feature_clip", 10.0),
         edge_mp_use_gate=bool(routing_cfg.get("edge_mp_use_gate", True)),
         edge_mp_aggregation=str(routing_cfg.get("edge_mp_aggregation", "sum")),

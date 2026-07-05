@@ -1,4 +1,4 @@
-"""Build reusable distribution-balanced 180-day streamflow block splits.
+"""Build reusable distribution-balanced streamflow block splits.
 
 The split is intentionally block-based: each non-overlapping block is assigned to
 train, validation, or test once, and the dataset can later create overlapping
@@ -29,7 +29,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--basin-file", type=Path, default=None, help="Optional basin list; defaults to config train_basin_file.")
     parser.add_argument("--output", required=True, type=Path, help="Output YAML split file.")
     parser.add_argument("--report-csv", type=Path, default=None, help="Optional per-block CSV report path.")
-    parser.add_argument("--block-days", type=int, default=180, help="Non-overlapping block length in days.")
+    block_group = parser.add_mutually_exclusive_group()
+    block_group.add_argument("--block-days", type=int, default=None, help="Non-overlapping fixed block length in days.")
+    block_group.add_argument("--block-years", type=int, default=None, help="Non-overlapping calendar-year block length.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for tie-breaking during greedy assignment.")
     parser.add_argument("--train-fraction", type=float, default=0.70)
     parser.add_argument("--validation-fraction", type=float, default=0.15)
@@ -259,8 +261,11 @@ def build_split(args: argparse.Namespace) -> tuple[dict[str, Any], pd.DataFrame]
     records: list[dict[str, Any]] = []
     block_start = first_block_start
     block_id = 0
-    while block_start + pd.DateOffset(days=args.block_days) <= final_end:
-        block_end = block_start + pd.DateOffset(days=args.block_days)
+    block_days = 180 if args.block_days is None and args.block_years is None else args.block_days
+    block_years = args.block_years
+    block_offset = pd.DateOffset(years=int(block_years)) if block_years is not None else pd.DateOffset(days=int(block_days))
+    while block_start + block_offset <= final_end:
+        block_end = block_start + block_offset
         mask = (time_index >= block_start) & (time_index < block_end)
         if int(mask.sum()) > 0:
             features = _block_features(targets[mask], block_start, block_end)
@@ -320,7 +325,8 @@ def build_split(args: argparse.Namespace) -> tuple[dict[str, Any], pd.DataFrame]
     payload = {
         "metadata": {
             "split_type": "distribution_balanced_nonoverlapping_blocks",
-            "block_days": int(args.block_days),
+            "block_days": None if block_years is not None else int(block_days),
+            "block_years": None if block_years is None else int(block_years),
             "seed": int(args.seed),
             "fractions": fractions,
             "context_days": int(context_days),
