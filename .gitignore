@@ -17,3 +17,5 @@ data/
 runs/
 analysis_sample_rapid_bounds_test/
 analysis_sample_rapid_diff_map_test/
+*.yml
+*.yaml
