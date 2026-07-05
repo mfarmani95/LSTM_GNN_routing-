@@ -33,3 +33,10 @@ analysis_sample_rapid_diff_map_test/
 # Config files generated from experiments
 *.yml
 *.yaml
+# Allow GitHub Actions workflows
+
+!.github/workflows/
+
+!.github/workflows/*.yml
+
+!.github/workflows/*.yaml
