@@ -12,8 +12,9 @@ import streamlit as st
 
 DB_PATH = Path("data/processed/routing_results.duckdb")
 
-st.set_page_config(page_title="Spatial Map", layout="wide")
-st.title("Spatial Map: Basin, Routing Graph, and Gauges")
+st.set_page_config(page_title="Spatial Network Map", page_icon="🗺️", layout="wide")
+
+st.title("Spatial Network Map")
 
 if not DB_PATH.exists():
     st.error(f"Database not found: {DB_PATH}")
