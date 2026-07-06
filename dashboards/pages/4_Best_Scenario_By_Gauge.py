@@ -12,10 +12,12 @@ else:
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+import duckdb
 import geopandas as gpd
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from shapely import wkt
 
 
 st.set_page_config(
@@ -26,40 +28,80 @@ st.set_page_config(
 
 DATA_DIR = ROOT_DIR / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
-
-# Change these filenames if yours are different
-METRICS_PATH = PROCESSED_DIR / "best_scenario_by_gauge.csv"
-GAUGE_LOCATION_PATH = PROCESSED_DIR / "gauge_locations.csv"
-BOUNDARY_PATH = PROCESSED_DIR / "salt_verde_boundary.geojson"
+DB_PATH = PROCESSED_DIR / "routing_results.duckdb"
 
 
 @st.cache_data
 def load_best_scenario_data() -> pd.DataFrame:
-    if not METRICS_PATH.exists():
-        st.error(f"Missing file: {METRICS_PATH}")
+    if not DB_PATH.exists():
+        st.error(f"Missing DuckDB file: {DB_PATH}")
         st.stop()
 
-    return pd.read_csv(METRICS_PATH)
+    con = duckdb.connect(str(DB_PATH), read_only=True)
+
+    query = """
+        SELECT
+            gauge_id,
+            lat,
+            lon,
+            scenario_id,
+            label,
+            loss_type,
+            lag_days,
+            architecture,
+            gnn_kgess,
+            rapid_kgess,
+            nwm_kgess,
+            kgess_improvement_rapid,
+            kgess_improvement_nwm,
+            rank
+        FROM best_scenario_by_gauge
+        WHERE rank = 1
+    """
+
+    df = con.execute(query).fetchdf()
+    con.close()
+
+    return df
 
 
 @st.cache_data
-def load_gauge_locations() -> pd.DataFrame:
-    if not GAUGE_LOCATION_PATH.exists():
-        st.error(f"Missing file: {GAUGE_LOCATION_PATH}")
-        st.stop()
-
-    return pd.read_csv(GAUGE_LOCATION_PATH)
-
-
-@st.cache_data
-def load_boundary_geojson():
-    if not BOUNDARY_PATH.exists():
-        st.warning(f"Salt–Verde boundary file not found: {BOUNDARY_PATH}")
+def load_basin_boundary_geojson():
+    if not DB_PATH.exists():
         return None
 
-    gdf = gpd.read_file(BOUNDARY_PATH)
-    gdf = gdf.to_crs("EPSG:4326")
-    return json.loads(gdf.to_json())
+    con = duckdb.connect(str(DB_PATH), read_only=True)
+
+    try:
+        boundary_df = con.execute(
+            """
+            SELECT
+                feature_id,
+                name,
+                geometry_wkt
+            FROM basin_boundary
+            """
+        ).fetchdf()
+    except Exception:
+        con.close()
+        return None
+
+    con.close()
+
+    if boundary_df.empty:
+        return None
+
+    try:
+        boundary_df["geometry"] = boundary_df["geometry_wkt"].apply(wkt.loads)
+        gdf = gpd.GeoDataFrame(
+            boundary_df.drop(columns=["geometry_wkt"]),
+            geometry="geometry",
+            crs="EPSG:4326",
+        )
+        gdf = gdf.to_crs("EPSG:4326")
+        return json.loads(gdf.to_json())
+    except Exception:
+        return None
 
 
 st.title("🏆 Best Scenario by Gauge Based on GNN KGESS")
@@ -71,47 +113,36 @@ st.markdown(
     """
 )
 
-metrics = load_best_scenario_data()
-locations = load_gauge_locations()
-boundary_geojson = load_boundary_geojson()
-
-required_metrics_cols = {"gauge_id", "best_scenario", "gnn_kgess"}
-required_location_cols = {"gauge_id", "latitude", "longitude"}
-
-missing_metrics = required_metrics_cols - set(metrics.columns)
-missing_locations = required_location_cols - set(locations.columns)
-
-if missing_metrics:
-    st.error(f"Missing columns in {METRICS_PATH.name}: {missing_metrics}")
-    st.write("Available columns:", list(metrics.columns))
-    st.stop()
-
-if missing_locations:
-    st.error(f"Missing columns in {GAUGE_LOCATION_PATH.name}: {missing_locations}")
-    st.write("Available columns:", list(locations.columns))
-    st.stop()
-
-df = metrics.merge(locations, on="gauge_id", how="left")
-
-if df[["latitude", "longitude"]].isna().any().any():
-    st.warning("Some gauges are missing latitude/longitude after merging.")
-
-df = df.dropna(subset=["latitude", "longitude"])
+df = load_best_scenario_data()
+boundary_geojson = load_basin_boundary_geojson()
 
 if df.empty:
-    st.error("No gauge data available for plotting after merging metrics and locations.")
+    st.error("The `best_scenario_by_gauge` table returned no rows.")
     st.stop()
 
-if "improvement" not in df.columns:
-    if "rapid_kgess" in df.columns:
-        df["improvement"] = df["gnn_kgess"] - df["rapid_kgess"]
-    else:
-        df["improvement"] = pd.NA
+df["gauge_id"] = df["gauge_id"].astype(str)
+df["gnn_kgess"] = pd.to_numeric(df["gnn_kgess"], errors="coerce")
+df["rapid_kgess"] = pd.to_numeric(df["rapid_kgess"], errors="coerce")
+df["nwm_kgess"] = pd.to_numeric(df["nwm_kgess"], errors="coerce")
+df["kgess_improvement_rapid"] = pd.to_numeric(
+    df["kgess_improvement_rapid"], errors="coerce"
+)
+df["kgess_improvement_nwm"] = pd.to_numeric(
+    df["kgess_improvement_nwm"], errors="coerce"
+)
+df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+
+df = df.dropna(subset=["gnn_kgess", "lat", "lon"])
+
+if df.empty:
+    st.error("No valid gauge rows after cleaning KGESS and coordinate columns.")
+    st.stop()
 
 # --------------------------------------------------
 # KPI cards
 # --------------------------------------------------
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
     st.metric("Number of gauges", f"{df['gauge_id'].nunique()}")
@@ -120,41 +151,75 @@ with col2:
     st.metric("Mean best GNN KGESS", f"{df['gnn_kgess'].mean():.3f}")
 
 with col3:
-    if "rapid_kgess" in df.columns:
-        st.metric("Mean RAPID KGESS", f"{df['rapid_kgess'].mean():.3f}")
-    else:
-        st.metric("Mean RAPID KGESS", "N/A")
+    st.metric("Mean RAPID KGESS", f"{df['rapid_kgess'].mean():.3f}")
 
 with col4:
-    if df["improvement"].notna().any():
-        st.metric("Mean improvement", f"{df['improvement'].mean():.3f}")
-    else:
-        st.metric("Mean improvement", "N/A")
+    st.metric("Mean NWM KGESS", f"{df['nwm_kgess'].mean():.3f}")
+
+with col5:
+    st.metric(
+        "Mean improvement vs RAPID",
+        f"{df['kgess_improvement_rapid'].mean():.3f}",
+    )
 
 st.divider()
+
+# --------------------------------------------------
+# Filters
+# --------------------------------------------------
+st.sidebar.header("Filters")
+
+loss_options = sorted(df["loss_type"].dropna().unique().tolist())
+selected_loss = st.sidebar.multiselect(
+    "Loss type",
+    options=loss_options,
+    default=loss_options,
+)
+
+arch_options = sorted(df["architecture"].dropna().unique().tolist())
+selected_arch = st.sidebar.multiselect(
+    "Architecture",
+    options=arch_options,
+    default=arch_options,
+)
+
+plot_df = df[
+    df["loss_type"].isin(selected_loss)
+    & df["architecture"].isin(selected_arch)
+].copy()
+
+if plot_df.empty:
+    st.warning("No gauges match the selected filters.")
+    st.stop()
 
 # --------------------------------------------------
 # Map
 # --------------------------------------------------
 st.subheader("Map: Best GNN KGESS by Gauge")
 
-center_lat = df["latitude"].mean()
-center_lon = df["longitude"].mean()
+center_lat = plot_df["lat"].mean()
+center_lon = plot_df["lon"].mean()
 
 fig = px.scatter_map(
-    df,
-    lat="latitude",
-    lon="longitude",
+    plot_df,
+    lat="lat",
+    lon="lon",
     color="gnn_kgess",
     size="gnn_kgess",
     hover_name="gauge_id",
     hover_data={
-        "best_scenario": True,
+        "scenario_id": True,
+        "label": True,
+        "loss_type": True,
+        "lag_days": True,
+        "architecture": True,
         "gnn_kgess": ":.3f",
-        "rapid_kgess": ":.3f" if "rapid_kgess" in df.columns else False,
-        "improvement": ":.3f" if df["improvement"].notna().any() else False,
-        "latitude": False,
-        "longitude": False,
+        "rapid_kgess": ":.3f",
+        "nwm_kgess": ":.3f",
+        "kgess_improvement_rapid": ":.3f",
+        "kgess_improvement_nwm": ":.3f",
+        "lat": False,
+        "lon": False,
     },
     color_continuous_scale="Viridis",
     zoom=7,
@@ -182,27 +247,35 @@ if boundary_geojson is not None:
             }
         ]
     )
+else:
+    st.info("Basin boundary layer was not available from `basin_boundary`.")
 
 st.plotly_chart(fig, width="stretch")
 
 # --------------------------------------------------
-# Bar chart
+# Bar chart: ranked gauges
 # --------------------------------------------------
 st.subheader("Graph: Ranked Gauges by Best GNN KGESS")
 
-ranked = df.sort_values("gnn_kgess", ascending=False)
+ranked = plot_df.sort_values("gnn_kgess", ascending=False)
 
 bar_fig = px.bar(
     ranked,
     x="gnn_kgess",
     y="gauge_id",
-    color="best_scenario",
+    color="scenario_id",
     orientation="h",
     hover_data={
-        "best_scenario": True,
+        "scenario_id": True,
+        "label": True,
+        "loss_type": True,
+        "lag_days": True,
+        "architecture": True,
         "gnn_kgess": ":.3f",
-        "rapid_kgess": ":.3f" if "rapid_kgess" in ranked.columns else False,
-        "improvement": ":.3f" if ranked["improvement"].notna().any() else False,
+        "rapid_kgess": ":.3f",
+        "nwm_kgess": ":.3f",
+        "kgess_improvement_rapid": ":.3f",
+        "kgess_improvement_nwm": ":.3f",
     },
     title="Best GNN KGESS by gauge",
 )
@@ -217,22 +290,63 @@ bar_fig.update_layout(
 st.plotly_chart(bar_fig, width="stretch")
 
 # --------------------------------------------------
+# Bar chart: improvement vs RAPID
+# --------------------------------------------------
+st.subheader("Graph: Improvement over RAPID")
+
+improvement_fig = px.bar(
+    ranked,
+    x="kgess_improvement_rapid",
+    y="gauge_id",
+    color="scenario_id",
+    orientation="h",
+    hover_data={
+        "scenario_id": True,
+        "gnn_kgess": ":.3f",
+        "rapid_kgess": ":.3f",
+        "kgess_improvement_rapid": ":.3f",
+    },
+    title="Best-scenario KGESS improvement over RAPID by gauge",
+)
+
+improvement_fig.update_layout(
+    yaxis=dict(autorange="reversed"),
+    xaxis_title="GNN KGESS - RAPID KGESS",
+    yaxis_title="Gauge ID",
+    height=650,
+)
+
+st.plotly_chart(improvement_fig, width="stretch")
+
+# --------------------------------------------------
 # Table
 # --------------------------------------------------
 st.subheader("Best Scenario Table")
 
-display_cols = ["gauge_id", "best_scenario", "gnn_kgess"]
-
-if "rapid_kgess" in df.columns:
-    display_cols.append("rapid_kgess")
-
-if "improvement" in df.columns:
-    display_cols.append("improvement")
-
-display_cols += ["latitude", "longitude"]
+display_cols = [
+    "gauge_id",
+    "scenario_id",
+    "label",
+    "loss_type",
+    "lag_days",
+    "architecture",
+    "gnn_kgess",
+    "rapid_kgess",
+    "nwm_kgess",
+    "kgess_improvement_rapid",
+    "kgess_improvement_nwm",
+    "lat",
+    "lon",
+]
 
 st.dataframe(
     ranked[display_cols],
     width="stretch",
     hide_index=True,
 )
+
+with st.expander("Debug: DuckDB source"):
+    st.write("DuckDB path:", str(DB_PATH))
+    st.write("Rows loaded:", len(df))
+    st.write("Columns:", list(df.columns))
+    st.dataframe(df.head(), width="stretch")
