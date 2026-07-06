@@ -33,6 +33,7 @@ DB_PATH = PROCESSED_DIR / "routing_results.duckdb"
 
 @st.cache_data
 def load_best_scenario_data() -> pd.DataFrame:
+    """Load best GNN scenario per gauge from DuckDB."""
     if not DB_PATH.exists():
         st.error(f"Missing DuckDB file: {DB_PATH}")
         st.stop()
@@ -67,6 +68,7 @@ def load_best_scenario_data() -> pd.DataFrame:
 
 @st.cache_data
 def load_basin_boundary_geojson():
+    """Load Salt–Verde basin boundary from DuckDB and convert WKT to GeoJSON."""
     if not DB_PATH.exists():
         return None
 
@@ -93,33 +95,86 @@ def load_basin_boundary_geojson():
 
     try:
         boundary_df["geometry"] = boundary_df["geometry_wkt"].apply(wkt.loads)
+
         gdf = gpd.GeoDataFrame(
             boundary_df.drop(columns=["geometry_wkt"]),
             geometry="geometry",
             crs="EPSG:4326",
         )
+
         gdf = gdf.to_crs("EPSG:4326")
         return json.loads(gdf.to_json())
+
     except Exception:
         return None
 
 
+@st.cache_data
+def load_river_network_lines() -> pd.DataFrame:
+    """Load routing river-network edges from DuckDB.
+
+    The routing_edges table already contains:
+        from_lat, from_lon, to_lat, to_lon
+    so no join with routing_nodes is needed.
+    """
+    if not DB_PATH.exists():
+        return pd.DataFrame()
+
+    con = duckdb.connect(str(DB_PATH), read_only=True)
+
+    try:
+        edges = con.execute(
+            """
+            SELECT
+                edge_id,
+                from_node,
+                to_node,
+                from_lat,
+                from_lon,
+                to_lat,
+                to_lon
+            FROM routing_edges
+            """
+        ).fetchdf()
+    except Exception:
+        con.close()
+        return pd.DataFrame()
+
+    con.close()
+
+    required_cols = ["from_lat", "from_lon", "to_lat", "to_lon"]
+    edges = edges.dropna(subset=required_cols)
+
+    return edges
+
+
+# --------------------------------------------------
+# Page title
+# --------------------------------------------------
 st.title("🏆 Best Scenario by Gauge Based on GNN KGESS")
 
 st.markdown(
     """
     This page shows the best-performing GNN scenario at each USGS gauge based on
     the highest GNN KGESS value. Gauge colors represent the best GNN KGESS score.
+    The map also includes the Salt–Verde basin boundary and the routing river-network graph.
     """
 )
 
+# --------------------------------------------------
+# Load data
+# --------------------------------------------------
 df = load_best_scenario_data()
 boundary_geojson = load_basin_boundary_geojson()
+river_edges = load_river_network_lines()
 
 if df.empty:
     st.error("The `best_scenario_by_gauge` table returned no rows.")
     st.stop()
 
+# --------------------------------------------------
+# Clean data
+# --------------------------------------------------
 df["gauge_id"] = df["gauge_id"].astype(str)
 df["gnn_kgess"] = pd.to_numeric(df["gnn_kgess"], errors="coerce")
 df["rapid_kgess"] = pd.to_numeric(df["rapid_kgess"], errors="coerce")
@@ -140,33 +195,20 @@ if df.empty:
     st.stop()
 
 # --------------------------------------------------
-# KPI cards
+# Sidebar filters
 # --------------------------------------------------
-col1, col2, col3, col4, col5 = st.columns(5)
+st.sidebar.header("Map Layers")
 
-with col1:
-    st.metric("Number of gauges", f"{df['gauge_id'].nunique()}")
+show_basin_boundary = st.sidebar.checkbox(
+    "Show basin boundary",
+    value=True,
+)
 
-with col2:
-    st.metric("Mean best GNN KGESS", f"{df['gnn_kgess'].mean():.3f}")
+show_river_network = st.sidebar.checkbox(
+    "Show river network",
+    value=True,
+)
 
-with col3:
-    st.metric("Mean RAPID KGESS", f"{df['rapid_kgess'].mean():.3f}")
-
-with col4:
-    st.metric("Mean NWM KGESS", f"{df['nwm_kgess'].mean():.3f}")
-
-with col5:
-    st.metric(
-        "Mean improvement vs RAPID",
-        f"{df['kgess_improvement_rapid'].mean():.3f}",
-    )
-
-st.divider()
-
-# --------------------------------------------------
-# Filters
-# --------------------------------------------------
 st.sidebar.header("Filters")
 
 loss_options = sorted(df["loss_type"].dropna().unique().tolist())
@@ -193,9 +235,37 @@ if plot_df.empty:
     st.stop()
 
 # --------------------------------------------------
-# Map
+# KPI cards
 # --------------------------------------------------
-st.subheader("Map: Best GNN KGESS by Gauge")
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+
+with col1:
+    st.metric("Number of gauges", f"{plot_df['gauge_id'].nunique()}")
+
+with col2:
+    st.metric("Mean best GNN KGESS", f"{plot_df['gnn_kgess'].mean():.3f}")
+
+with col3:
+    st.metric("Mean RAPID KGESS", f"{plot_df['rapid_kgess'].mean():.3f}")
+
+with col4:
+    st.metric("Mean NWM KGESS", f"{plot_df['nwm_kgess'].mean():.3f}")
+
+with col5:
+    st.metric(
+        "Mean improvement vs RAPID",
+        f"{plot_df['kgess_improvement_rapid'].mean():.3f}",
+    )
+
+with col6:
+    st.metric("River edges", f"{len(river_edges):,}")
+
+st.divider()
+
+# --------------------------------------------------
+# Main map
+# --------------------------------------------------
+st.subheader("Map: River Network and Best GNN KGESS by Gauge")
 
 center_lat = plot_df["lat"].mean()
 center_lon = plot_df["lon"].mean()
@@ -223,8 +293,8 @@ fig = px.scatter_map(
     },
     color_continuous_scale="Viridis",
     zoom=7,
-    height=650,
-    title="Best scenario by gauge based on GNN KGESS",
+    height=700,
+    title="Routing river network with best GNN KGESS by gauge",
 )
 
 fig.update_layout(
@@ -236,24 +306,67 @@ fig.update_layout(
     margin=dict(l=0, r=0, t=50, b=0),
 )
 
-if boundary_geojson is not None:
-    fig.update_layout(
-        map_layers=[
-            {
-                "source": boundary_geojson,
-                "type": "line",
-                "color": "black",
-                "line": {"width": 2},
-            }
-        ]
+map_layers = []
+
+# Basin boundary layer
+if show_basin_boundary and boundary_geojson is not None:
+    map_layers.append(
+        {
+            "source": boundary_geojson,
+            "type": "line",
+            "color": "black",
+            "line": {"width": 2},
+        }
     )
-else:
+elif show_basin_boundary:
     st.info("Basin boundary layer was not available from `basin_boundary`.")
+
+# River network layer
+if show_river_network and not river_edges.empty:
+    river_features = []
+
+    for _, row in river_edges.iterrows():
+        river_features.append(
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [
+                        [float(row["from_lon"]), float(row["from_lat"])],
+                        [float(row["to_lon"]), float(row["to_lat"])],
+                    ],
+                },
+                "properties": {
+                    "edge_id": int(row["edge_id"]),
+                    "from_node": int(row["from_node"]),
+                    "to_node": int(row["to_node"]),
+                },
+            }
+        )
+
+    river_geojson = {
+        "type": "FeatureCollection",
+        "features": river_features,
+    }
+
+    map_layers.append(
+        {
+            "source": river_geojson,
+            "type": "line",
+            "color": "royalblue",
+            "line": {"width": 1},
+        }
+    )
+elif show_river_network:
+    st.info("River network layer was not available from `routing_edges`.")
+
+if map_layers:
+    fig.update_layout(map_layers=map_layers)
 
 st.plotly_chart(fig, width="stretch")
 
 # --------------------------------------------------
-# Graph 1: Ranked gauges by GNN KGESS
+# Graph 1: Ranked gauges by best GNN KGESS
 # --------------------------------------------------
 st.subheader("Graph: Ranked Gauges by Best GNN KGESS")
 
@@ -364,7 +477,7 @@ scenario_fig.update_layout(
 st.plotly_chart(scenario_fig, width="stretch")
 
 # --------------------------------------------------
-# Graph 4: GNN vs benchmarks
+# Graph 4: KGESS distribution comparison
 # --------------------------------------------------
 st.subheader("Graph: GNN KGESS Compared with RAPID and NWM")
 
@@ -431,5 +544,8 @@ st.dataframe(
 with st.expander("Debug: DuckDB source"):
     st.write("DuckDB path:", str(DB_PATH))
     st.write("Rows loaded:", len(df))
+    st.write("River edges loaded:", len(river_edges))
     st.write("Columns:", list(df.columns))
     st.dataframe(df.head(), width="stretch")
+    st.write("River edge preview:")
+    st.dataframe(river_edges.head(), width="stretch")
