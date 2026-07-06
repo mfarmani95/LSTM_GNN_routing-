@@ -10,10 +10,18 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "duckdb>=1.5.4",
+  "geopandas>=1.1.3",
+  "h5netcdf>=1.8.1",
+  "netcdf4>=1.7.3",
   "numpy",
   "pandas",
   "plotly>=6.8.0",
+  "pyogrio>=0.12.1",
+  "pyproj>=3.7.1",
+  "rasterio>=1.4.4",
   "ruamel.yaml",
+  "scipy>=1.15.3",
+  "shapely>=2.1.2",
   "streamlit>=1.58.0",
   "torch",
   "torch-geometric",
