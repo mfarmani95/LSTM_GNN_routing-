@@ -253,7 +253,7 @@ else:
 st.plotly_chart(fig, width="stretch")
 
 # --------------------------------------------------
-# Bar chart: ranked gauges
+# Graph 1: Ranked gauges by GNN KGESS
 # --------------------------------------------------
 st.subheader("Graph: Ranked Gauges by Best GNN KGESS")
 
@@ -290,18 +290,27 @@ bar_fig.update_layout(
 st.plotly_chart(bar_fig, width="stretch")
 
 # --------------------------------------------------
-# Bar chart: improvement vs RAPID
+# Graph 2: Improvement over RAPID
 # --------------------------------------------------
-st.subheader("Graph: Improvement over RAPID")
+st.subheader("Graph: Best-Scenario Improvement over RAPID")
+
+improvement_ranked = plot_df.sort_values(
+    "kgess_improvement_rapid",
+    ascending=False,
+)
 
 improvement_fig = px.bar(
-    ranked,
+    improvement_ranked,
     x="kgess_improvement_rapid",
     y="gauge_id",
     color="scenario_id",
     orientation="h",
     hover_data={
         "scenario_id": True,
+        "label": True,
+        "loss_type": True,
+        "lag_days": True,
+        "architecture": True,
         "gnn_kgess": ":.3f",
         "rapid_kgess": ":.3f",
         "kgess_improvement_rapid": ":.3f",
@@ -317,6 +326,80 @@ improvement_fig.update_layout(
 )
 
 st.plotly_chart(improvement_fig, width="stretch")
+
+# --------------------------------------------------
+# Graph 3: Scenario frequency
+# --------------------------------------------------
+st.subheader("Graph: How Often Each Scenario Is Best")
+
+scenario_counts = (
+    plot_df.groupby(["scenario_id", "loss_type", "architecture"], as_index=False)
+    .size()
+    .rename(columns={"size": "n_gauges"})
+    .sort_values("n_gauges", ascending=False)
+)
+
+scenario_fig = px.bar(
+    scenario_counts,
+    x="n_gauges",
+    y="scenario_id",
+    color="loss_type",
+    orientation="h",
+    hover_data={
+        "scenario_id": True,
+        "loss_type": True,
+        "architecture": True,
+        "n_gauges": True,
+    },
+    title="Number of gauges where each scenario is the best",
+)
+
+scenario_fig.update_layout(
+    yaxis=dict(autorange="reversed"),
+    xaxis_title="Number of gauges",
+    yaxis_title="Scenario ID",
+    height=500,
+)
+
+st.plotly_chart(scenario_fig, width="stretch")
+
+# --------------------------------------------------
+# Graph 4: GNN vs benchmarks
+# --------------------------------------------------
+st.subheader("Graph: GNN KGESS Compared with RAPID and NWM")
+
+comparison_long = plot_df[
+    ["gauge_id", "gnn_kgess", "rapid_kgess", "nwm_kgess"]
+].melt(
+    id_vars="gauge_id",
+    value_vars=["gnn_kgess", "rapid_kgess", "nwm_kgess"],
+    var_name="model",
+    value_name="kgess",
+)
+
+comparison_long["model"] = comparison_long["model"].map(
+    {
+        "gnn_kgess": "Best GNN",
+        "rapid_kgess": "RAPID",
+        "nwm_kgess": "NWM",
+    }
+)
+
+comparison_fig = px.box(
+    comparison_long,
+    x="model",
+    y="kgess",
+    points="all",
+    title="Distribution of KGESS across gauges",
+)
+
+comparison_fig.update_layout(
+    xaxis_title="Model",
+    yaxis_title="KGESS",
+    height=550,
+)
+
+st.plotly_chart(comparison_fig, width="stretch")
 
 # --------------------------------------------------
 # Table
