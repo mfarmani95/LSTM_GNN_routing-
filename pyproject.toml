@@ -9,9 +9,12 @@ description = "Standalone LSTM runoff generation and GNN streamflow routing expe
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "duckdb>=1.5.4",
   "numpy",
   "pandas",
+  "plotly>=6.8.0",
   "ruamel.yaml",
+  "streamlit>=1.58.0",
   "torch",
   "torch-geometric",
   "tqdm",

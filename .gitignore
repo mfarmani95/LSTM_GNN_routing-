@@ -20,6 +20,9 @@ runs/
 paper_analysis/
 scalers/
 configs/
+*.duckdb
+*.db
+data/processed/
 
 # Analysis output folders
 analysis_sample_rapid_bounds_test/

@@ -1265,11 +1265,14 @@ name = "lstm-gnn-routing"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "duckdb" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "plotly" },
     { name = "ruamel-yaml" },
+    { name = "streamlit" },
     { name = "torch" },
     { name = "torch-geometric" },
     { name = "tqdm" },
@@ -1327,6 +1330,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "duckdb", specifier = ">=1.5.4" },
     { name = "duckdb", marker = "extra == 'dashboard'" },
     { name = "duckdb", marker = "extra == 'database'" },
     { name = "geopandas", marker = "extra == 'preprocess'" },
@@ -1335,6 +1339,7 @@ requires-dist = [
     { name = "netcdf4", marker = "extra == 'preprocess'" },
     { name = "numpy" },
     { name = "pandas" },
+    { name = "plotly", specifier = ">=6.8.0" },
     { name = "plotly", marker = "extra == 'dashboard'" },
     { name = "pyarrow", marker = "extra == 'dashboard'" },
     { name = "pyarrow", marker = "extra == 'database'" },
@@ -1342,6 +1347,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "ruamel-yaml" },
     { name = "ruff", marker = "extra == 'dev'" },
+    { name = "streamlit", specifier = ">=1.58.0" },
     { name = "streamlit", marker = "extra == 'dashboard'" },
     { name = "torch" },
     { name = "torch-geometric" },
